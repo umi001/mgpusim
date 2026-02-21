@@ -11,6 +11,7 @@ import (
 	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/akita/v4/simulation"
 	"github.com/sarchlab/mgpusim/v4/amd/driver"
+	"github.com/sarchlab/mgpusim/v4/amd/samples/runner/timingconfig/accelbuilder"
 	"github.com/sarchlab/mgpusim/v4/amd/samples/runner/timingconfig/gpubuilder"
 	"github.com/sarchlab/mgpusim/v4/amd/samples/runner/timingconfig/mi300a"
 	"github.com/sarchlab/mgpusim/v4/amd/samples/runner/timingconfig/r9nano"
@@ -21,6 +22,7 @@ type Builder struct {
 	simulation *simulation.Simulation
 
 	numGPUs            int
+	numAccelerators    int
 	numCUPerSA         int
 	numSAPerGPU        int
 	cpuMemSize         uint64
@@ -66,6 +68,12 @@ func (b Builder) WithMagicMemoryCopy() Builder {
 	return b
 }
 
+// WithNumAccelerators sets the number of inference accelerators to simulate.
+func (b Builder) WithNumAccelerators(n int) Builder {
+	b.numAccelerators = n
+	return b
+}
+
 // WithGPUType sets the GPU type for timing simulation (r9nano or mi300a).
 func (b Builder) WithGPUType(gpuType string) Builder {
 	b.gpuType = gpuType
@@ -98,6 +106,9 @@ func (b Builder) Build() *sim.Domain {
 		rootComplexID, pcieConnector,
 		gpuBuilder, gpuDriver,
 		pmcAddressTable)
+
+	b.createAccelerators(
+		rootComplexID, pcieConnector, gpuDriver)
 
 	pcieConnector.EstablishRoute()
 
@@ -228,6 +239,7 @@ func (b *Builder) createConnection(
 	rootComplexID := pcieConnector.AddRootComplex(
 		[]sim.Port{
 			gpuDriver.GetPortByName("GPU"),
+			gpuDriver.GetPortByName("Accelerator"),
 			gpuDriver.GetPortByName("MMU"),
 			mmuComponent.GetPortByName("Migration"),
 			mmuComponent.GetPortByName("Top"),
@@ -284,6 +296,48 @@ func (b *Builder) configRDMAEngine(
 	b.rdmaAddressMapper.LowModules = append(
 		b.rdmaAddressMapper.LowModules,
 		gpu.GetPortByName("RDMAData").AsRemote())
+}
+
+func (b *Builder) createAccelerators(
+	rootComplexID int,
+	pcieConnector *pcie.Connector,
+	gpuDriver *driver.Driver,
+) {
+	for i := 0; i < b.numAccelerators; i++ {
+		b.createAccelerator(i, rootComplexID, pcieConnector, gpuDriver)
+	}
+}
+
+func (b *Builder) createAccelerator(
+	index int,
+	rootComplexID int,
+	pcieConnector *pcie.Connector,
+	gpuDriver *driver.Driver,
+) {
+	name := fmt.Sprintf("Accel[%d]", index)
+
+	// TODO: Configure accelerator memory address offset.
+	// Currently accelerators share memory with GPUs via the global storage.
+	// If accelerators need their own DRAM, adjust the offset and
+	// global storage size accordingly.
+	memAddrOffset := uint64(b.numGPUs+1+index) * b.gpuMemSize
+
+	ab := accelbuilder.MakeBuilder().
+		WithSimulation(b.simulation).
+		WithGlobalStorage(b.globalStorage).
+		WithMemAddrOffset(memAddrOffset)
+
+	accel := ab.Build(name)
+
+	gpuDriver.RegisterAccelerator(
+		accel.GetPortByName("ToDriver"),
+		driver.DeviceProperties{
+			DRAMSize: b.gpuMemSize,
+		},
+	)
+
+	switchID := pcieConnector.AddSwitch(rootComplexID)
+	pcieConnector.PlugInDevice(switchID, accel.Ports())
 }
 
 // func (b *Builder) configPMC(
