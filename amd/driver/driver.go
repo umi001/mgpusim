@@ -59,6 +59,11 @@ type Driver struct {
 	isCurrentlyMigratingOnePage     bool
 
 	RemotePMCPorts []sim.Port
+
+	// Accelerator support
+	Accelerators     []sim.Port
+	accelPort        sim.Port
+	accelReqsToSend  []sim.Msg
 }
 
 // Run starts a new threads that handles all commands in the command queues
@@ -160,11 +165,33 @@ func (d *Driver) RegisterGPU(
 	d.devices = append(d.devices, gpuDevice)
 }
 
+// RegisterAccelerator tells the driver about the existence of an accelerator.
+func (d *Driver) RegisterAccelerator(
+	accelPort sim.Port,
+	properties DeviceProperties,
+) {
+	d.Accelerators = append(d.Accelerators, accelPort)
+
+	accelDevice := &internal.Device{
+		ID:       len(d.devices),
+		Type:     internal.DeviceTypeAccelerator,
+		MemState: internal.NewDeviceMemoryState(d.Log2PageSize),
+		Properties: internal.DeviceProperties{
+			DRAMSize: properties.DRAMSize,
+		},
+	}
+	accelDevice.SetTotalMemSize(properties.DRAMSize)
+	d.memAllocator.RegisterDevice(accelDevice)
+
+	d.devices = append(d.devices, accelDevice)
+}
+
 // Tick ticks
 func (d *Driver) Tick() bool {
 	madeProgress := false
 
 	madeProgress = d.sendToGPUs() || madeProgress
+	madeProgress = d.sendToAccelerators() || madeProgress
 	madeProgress = d.sendToMMU() || madeProgress
 	madeProgress = d.sendMigrationReqToCP() || madeProgress
 
@@ -185,6 +212,12 @@ func (d *Driver) sendToGPUs() bool {
 	}
 
 	req := d.requestsToSend[0]
+
+	// Route accelerator messages through accelPort
+	if _, ok := req.(*protocol.AccelInferenceReq); ok {
+		return false // handled by sendToAccelerators
+	}
+
 	err := d.gpuPort.Send(req)
 	if err == nil {
 		d.requestsToSend = d.requestsToSend[1:]
@@ -194,8 +227,70 @@ func (d *Driver) sendToGPUs() bool {
 	return false
 }
 
+func (d *Driver) sendToAccelerators() bool {
+	if d.accelPort == nil {
+		return false
+	}
+
+	if len(d.accelReqsToSend) == 0 {
+		return false
+	}
+
+	req := d.accelReqsToSend[0]
+	err := d.accelPort.Send(req)
+	if err == nil {
+		d.accelReqsToSend = d.accelReqsToSend[1:]
+		return true
+	}
+
+	return false
+}
+
 //nolint:gocyclo
 func (d *Driver) processReturnReq() bool {
+	madeProgress := d.processReturnReqFromGPU()
+	madeProgress = d.processReturnReqFromAccel() || madeProgress
+	return madeProgress
+}
+
+func (d *Driver) processReturnReqFromAccel() bool {
+	if d.accelPort == nil {
+		return false
+	}
+
+	req := d.accelPort.PeekIncoming()
+	if req == nil {
+		return false
+	}
+
+	switch req := req.(type) {
+	case *protocol.AccelInferenceRsp:
+		d.accelPort.RetrieveIncoming()
+		return d.processAccelInferenceReturn(req)
+	}
+
+	return false
+}
+
+func (d *Driver) processAccelInferenceReturn(
+	rsp *protocol.AccelInferenceRsp,
+) bool {
+	req, cmd, cmdQueue := d.findCommandByReqID(rsp.RspTo)
+	cmd.RemoveReq(req)
+
+	d.logTaskToGPUClear(req)
+
+	if len(cmd.GetReqs()) == 0 {
+		cmdQueue.IsRunning = false
+		cmdQueue.Dequeue()
+
+		d.logCmdComplete(cmd)
+	}
+
+	return true
+}
+
+func (d *Driver) processReturnReqFromGPU() bool {
 	req := d.gpuPort.PeekIncoming()
 	if req == nil {
 		return false
@@ -279,6 +374,9 @@ func (d *Driver) processOneCommand(
 	case *LaunchUnifiedMultiGPUKernelCommand:
 		d.logCmdStart(cmd)
 		return d.processUnifiedMultiGPULaunchKernelCommand(cmd, cmdQueue)
+	case *AccelInferenceCommand:
+		d.logCmdStart(cmd)
+		return d.processAccelInferenceCommand(cmd, cmdQueue)
 	default:
 		return d.processCommandWithMiddleware(cmd, cmdQueue)
 	}
@@ -334,6 +432,33 @@ func (d *Driver) logTaskToGPUClear(
 	req sim.Msg,
 ) {
 	tracing.TraceReqFinalize(req, d)
+}
+
+func (d *Driver) processAccelInferenceCommand(
+	cmd *AccelInferenceCommand,
+	queue *CommandQueue,
+) bool {
+	req := protocol.NewAccelInferenceReq(
+		d.accelPort, d.Accelerators[cmd.AccelID])
+	req.PID = queue.Context.pid
+	req.OpType = cmd.OpType
+	req.Params = cmd.Params
+	req.InputAddr = cmd.InputAddr
+	req.OutputAddr = cmd.OutputAddr
+	req.WeightsAddr = cmd.WeightsAddr
+	req.BiasAddr = cmd.BiasAddr
+	req.InputSize = cmd.InputSize
+	req.OutputSize = cmd.OutputSize
+	req.WeightsSize = cmd.WeightsSize
+
+	queue.IsRunning = true
+	cmd.Reqs = append(cmd.Reqs, req)
+
+	d.accelReqsToSend = append(d.accelReqsToSend, req)
+
+	d.logTaskToGPUInitiate(cmd, req)
+
+	return true
 }
 
 func (d *Driver) processLaunchKernelCommand(

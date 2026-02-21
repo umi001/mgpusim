@@ -9,6 +9,7 @@ const (
 	DeviceTypeCPU
 	DeviceTypeGPU
 	DeviceTypeUnifiedGPU
+	DeviceTypeAccelerator
 )
 
 // AllocatorType marks the type of memory allocator

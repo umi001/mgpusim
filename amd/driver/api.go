@@ -12,6 +12,7 @@ import (
 	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/mgpusim/v4/amd/driver/internal"
 	"github.com/sarchlab/mgpusim/v4/amd/insts"
+	"github.com/sarchlab/mgpusim/v4/amd/protocol"
 )
 
 var nextPID uint64
@@ -289,5 +290,59 @@ func (d *Driver) MemCopyD2H(ctx *Context, dst interface{}, src Ptr) {
 func (d *Driver) MemCopyD2D(ctx *Context, dst Ptr, src Ptr, num int) {
 	queue := d.CreateCommandQueue(ctx)
 	d.EnqueueMemCopyD2D(queue, dst, src, num)
+	d.DrainCommandQueue(queue)
+}
+
+// GetNumAccelerators returns the number of accelerators in the platform.
+func (d *Driver) GetNumAccelerators() int {
+	return len(d.Accelerators)
+}
+
+// SelectAccelerator selects the accelerator to use for subsequent
+// accelerator API calls.
+func (d *Driver) SelectAccelerator(c *Context, accelID int) {
+	if accelID >= len(d.Accelerators) {
+		log.Panicf("Accelerator %d is not available", accelID)
+	}
+	c.currentAccelID = accelID
+}
+
+// EnqueueAccelInference enqueues an accelerator inference operation.
+func (d *Driver) EnqueueAccelInference(
+	queue *CommandQueue,
+	opType protocol.AccelOpType,
+	params protocol.AccelOpParams,
+	inputAddr, outputAddr, weightsAddr, biasAddr uint64,
+	inputSize, outputSize, weightsSize [4]uint32,
+) {
+	cmd := &AccelInferenceCommand{
+		ID:          sim.GetIDGenerator().Generate(),
+		AccelID:     queue.Context.currentAccelID,
+		OpType:      opType,
+		Params:      params,
+		InputAddr:   inputAddr,
+		OutputAddr:  outputAddr,
+		WeightsAddr: weightsAddr,
+		BiasAddr:    biasAddr,
+		InputSize:   inputSize,
+		OutputSize:  outputSize,
+		WeightsSize: weightsSize,
+	}
+
+	d.Enqueue(queue, cmd)
+}
+
+// AccelInference runs an accelerator inference operation synchronously.
+func (d *Driver) AccelInference(
+	ctx *Context,
+	opType protocol.AccelOpType,
+	params protocol.AccelOpParams,
+	inputAddr, outputAddr, weightsAddr, biasAddr uint64,
+	inputSize, outputSize, weightsSize [4]uint32,
+) {
+	queue := d.CreateCommandQueue(ctx)
+	d.EnqueueAccelInference(queue, opType, params,
+		inputAddr, outputAddr, weightsAddr, biasAddr,
+		inputSize, outputSize, weightsSize)
 	d.DrainCommandQueue(queue)
 }
