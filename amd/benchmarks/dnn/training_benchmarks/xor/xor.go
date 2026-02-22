@@ -7,6 +7,7 @@ import (
 
 	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/gputensor"
 	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/layers"
+	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/tensor"
 	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/training"
 	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/training/optimization"
 	"github.com/sarchlab/mgpusim/v4/amd/driver"
@@ -16,7 +17,7 @@ import (
 type Benchmark struct {
 	driver  *driver.Driver
 	context *driver.Context
-	to      *gputensor.GPUOperator
+	to      tensor.Operator
 
 	gpus []int
 
@@ -30,8 +31,9 @@ func NewBenchmark(driver *driver.Driver) *Benchmark {
 
 	b.driver = driver
 	b.context = b.driver.Init()
-	b.to = gputensor.NewGPUOperator(b.driver, b.context)
-	b.to.EnableVerification()
+	gpuOp := gputensor.NewGPUOperator(b.driver, b.context)
+	gpuOp.EnableVerification()
+	b.to = gpuOp
 
 	b.network = training.Network{
 		Layers: []layers.Layer{
