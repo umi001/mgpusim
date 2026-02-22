@@ -9,7 +9,6 @@ import (
 
 	"github.com/sarchlab/mgpusim/v4/amd/driver"
 
-	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/gputensor"
 	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/tensor"
 	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/training"
 	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/training/optimization"
@@ -18,7 +17,7 @@ import (
 // DataParallelismMultiGPUTrainer can use multiple GPUs to train the DNN model
 // in the data parallelism style.
 type DataParallelismMultiGPUTrainer struct {
-	TensorOperators  []*gputensor.GPUOperator
+	TensorOperators  []tensor.Operator
 	Networks         []training.Network
 	DataSource       []training.DataSource
 	LossFunc         []training.LossFunction
@@ -166,10 +165,10 @@ func (t DataParallelismMultiGPUTrainer) averageGradient() {
 			continue
 		}
 
-		var gradients []*gputensor.Tensor
+		var gradients []tensor.DeviceTensor
 		for _, n := range t.Networks {
 			gradients = append(gradients,
-				n.Layers[l].Gradients().(*gputensor.Tensor))
+				n.Layers[l].Gradients().(tensor.DeviceTensor))
 		}
 
 		gpuNum := len(t.GPUs)
