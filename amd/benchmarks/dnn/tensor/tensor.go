@@ -1,6 +1,8 @@
 // Package tensor defines the tensor interface.
 package tensor
 
+import "github.com/sarchlab/mgpusim/v4/amd/driver"
+
 // A Tensor is a multi-dimension matrix.
 type Tensor interface {
 	// Dim returns the number of dimension of the tensor
@@ -28,6 +30,13 @@ type Tensor interface {
 
 	// SetDescriptor sets the descriptor of the tensor.
 	SetDescriptor(d string)
+}
+
+// DeviceTensor extends Tensor with a device memory pointer.
+// Implemented by gputensor.Tensor and acceltensor.Tensor.
+type DeviceTensor interface {
+	Tensor
+	Ptr() driver.Ptr
 }
 
 // A SimpleTensor is a multi-dimensional matrix.
