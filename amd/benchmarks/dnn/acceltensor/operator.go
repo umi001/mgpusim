@@ -6,9 +6,6 @@ import (
 	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/tensor"
 	"github.com/sarchlab/mgpusim/v4/amd/driver"
 	"github.com/sarchlab/mgpusim/v4/amd/protocol"
-	"gonum.org/v1/gonum/blas"
-	"gonum.org/v1/gonum/blas/blas64"
-	"gonum.org/v1/gonum/mat"
 )
 
 var sizeOfFloat32 = 4
@@ -184,37 +181,6 @@ func (o *Operator) Gemm(
 		[4]uint32{m, n, 1, 1},
 		[4]uint32{k, n, 1, 1},
 	)
-
-	return out
-}
-
-func (to CPUOperator) Gemm(
-	transA, transB bool,
-	alpha, beta float64,
-	a, b, c Tensor,
-) Tensor {
-	to.mustBeTwoDimension(a)
-	to.mustBeTwoDimension(b)
-	to.mustBeTwoDimension(c)
-
-	out := to.Clone(c)
-
-	ma := mat.NewDense(a.Size()[0], a.Size()[1], a.Vector())
-	mb := mat.NewDense(b.Size()[0], b.Size()[1], b.Vector())
-	mc := mat.NewDense(c.Size()[0], c.Size()[1], out.Vector())
-
-	gemmTransA := blas.NoTrans
-	if transA {
-		gemmTransA = blas.Trans
-	}
-
-	gemmTransB := blas.NoTrans
-	if transB {
-		gemmTransB = blas.Trans
-	}
-
-	blas64.Gemm(gemmTransA, gemmTransB,
-		1, ma.RawMatrix(), mb.RawMatrix(), 1, mc.RawMatrix())
 
 	return out
 }
