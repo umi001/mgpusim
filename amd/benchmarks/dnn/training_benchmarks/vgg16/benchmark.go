@@ -119,6 +119,7 @@ func (b *Benchmark) opForLayer(
 	return gpuOp
 }
 
+//nolint:funlen
 func (b *Benchmark) defineNetwork(gpuID int) {
 	context := b.driver.InitWithExistingPID(b.ctx)
 	b.driver.SelectGPU(context, gpuID)
