@@ -5,6 +5,7 @@ import (
 	"math"
 
 	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/gputensor"
+	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/tensor"
 	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/mccl"
 
 	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/dataset/mnist"
@@ -19,7 +20,7 @@ import (
 type Benchmark struct {
 	driver   *driver.Driver
 	ctx      *driver.Context
-	to       []*gputensor.GPUOperator
+	to       []tensor.Operator
 	gpus     []int
 	contexts []*driver.Context
 
@@ -158,11 +159,12 @@ func (b *Benchmark) randomizeParams() {
 			continue
 		}
 
-		params := make([]*gputensor.Tensor, gpuNum)
+		params := make([]tensor.DeviceTensor, gpuNum)
 		datas := make([]driver.Ptr, gpuNum)
 
 		for j := 0; j < gpuNum; j++ {
-			params[j] = b.networks[j].Layers[i].Parameters().(*gputensor.Tensor)
+			params[j] = b.networks[j].Layers[i].
+				Parameters().(tensor.DeviceTensor)
 		}
 
 		dataSizeArr := params[0].Size()
