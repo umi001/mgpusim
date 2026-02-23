@@ -43,6 +43,10 @@ type Comp struct {
 	currentTxn   *transaction
 	localModules mem.AddressToPortMapper
 
+	// Metrics
+	totalOps    int
+	totalCycles int
+
 	// TODO: Add more internal state as the model is refined:
 	//   - pendingMemReads / pendingMemWrites for tracking memory transactions
 	//   - sramOccupancy for modeling on-chip buffer contention
@@ -95,6 +99,9 @@ func (c *Comp) acceptNewReq() bool {
 // startOperation initializes a new transaction for the given request.
 func (c *Comp) startOperation(req *protocol.AccelInferenceReq) {
 	cycles := c.estimateCycles(req)
+
+	c.totalOps++
+	c.totalCycles += cycles
 
 	c.currentTxn = &transaction{
 		req:          req,
@@ -322,6 +329,16 @@ func (c *Comp) processMemRsp() bool {
 	//   - Track which tiles are ready for compute
 
 	return true
+}
+
+// TotalOps returns the number of operations processed.
+func (c *Comp) TotalOps() int {
+	return c.totalOps
+}
+
+// TotalCycles returns the total estimated compute cycles.
+func (c *Comp) TotalCycles() int {
+	return c.totalCycles
 }
 
 // SetFreq sets the operating frequency of the accelerator.

@@ -88,7 +88,7 @@ func (b Builder) Build() *sim.Domain {
 	b.platform = &sim.Domain{}
 
 	b.globalStorage = mem.NewStorage(
-		uint64(b.numGPUs)*b.gpuMemSize + b.cpuMemSize)
+		uint64(b.numGPUs+b.numAccelerators)*b.gpuMemSize + b.cpuMemSize)
 
 	mmuComp, pageTable := b.createMMU()
 	gpuDriver := b.buildGPUDriver(pageTable)

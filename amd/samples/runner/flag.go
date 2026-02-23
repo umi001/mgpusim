@@ -56,6 +56,9 @@ this number is not given or a invalid number is given number, a random port
 will be used.`)
 var disableAkitaRTM = flag.Bool("disable-rtm", false, "Disable the AkitaRTM monitoring portal")
 
+var numAccelFlag = flag.Int("num-accel", 0,
+	"Number of inference accelerators to simulate.")
+
 var analyzerNameFlag = flag.String("analyzer-name", "",
 	"The name of the analyzer to use.")
 
@@ -105,6 +108,7 @@ func (r *Runner) parseSimulationFlags() {
 		r.UseUnifiedMemory = true
 	}
 
+	r.NumAccel = *numAccelFlag
 	r.ArchType = parseArchFlag()
 	r.GPUType = parseGPUTypeFlag()
 }
