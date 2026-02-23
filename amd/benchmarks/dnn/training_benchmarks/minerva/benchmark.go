@@ -2,8 +2,12 @@
 package minerva
 
 import (
+	"encoding/json"
+	"log"
 	"math"
+	"os"
 
+	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/acceltensor"
 	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/gputensor"
 	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/tensor"
 	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/mccl"
@@ -16,22 +20,31 @@ import (
 	"github.com/sarchlab/mgpusim/v4/amd/driver"
 )
 
+// accelConfig defines the JSON structure for accelerator configuration.
+type accelConfig struct {
+	AccelLayers []int `json:"accel_layers"`
+}
+
 // Benchmark defines the Mineva network training benchmark.
 type Benchmark struct {
 	driver   *driver.Driver
 	ctx      *driver.Context
 	to       []tensor.Operator
+	lastOp   []tensor.Operator // operator of the last layer (for loss func)
 	gpus     []int
 	contexts []*driver.Context
 
 	networks []training.Network
 	trainer  gputraining.DataParallelismMultiGPUTrainer
 
+	accelLayerSet map[int]bool
+
 	BatchSize          int
 	Epoch              int
 	MaxBatchPerEpoch   int
 	EnableTesting      bool
 	EnableVerification bool
+	AccelConfigPath    string
 }
 
 // NewBenchmark creates a new benchmark.
@@ -50,6 +63,8 @@ func (b *Benchmark) SelectGPU(gpuIDs []int) {
 }
 
 func (b *Benchmark) init() {
+	b.accelLayerSet = b.loadAccelConfig()
+
 	for _, gpu := range b.gpus {
 		b.defineNetwork(gpu)
 	}
@@ -58,30 +73,107 @@ func (b *Benchmark) init() {
 	b.randomizeParams()
 }
 
+func (b *Benchmark) loadAccelConfig() map[int]bool {
+	set := make(map[int]bool)
+
+	path := b.AccelConfigPath
+	if path == "" {
+		path = "accel_config.json"
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return set
+	}
+
+	var cfg accelConfig
+
+	err = json.Unmarshal(data, &cfg)
+	if err != nil {
+		log.Printf("Warning: invalid accel_config.json: %v", err)
+		return set
+	}
+
+	for _, id := range cfg.AccelLayers {
+		set[id] = true
+	}
+
+	return set
+}
+
+func (b *Benchmark) opForLayer(
+	layerID int,
+	gpuOp, accelOp tensor.Operator,
+) tensor.Operator {
+	if b.accelLayerSet[layerID] {
+		return accelOp
+	}
+
+	return gpuOp
+}
+
+// pickReluOp chooses the operator for a ReLU layer sitting between two FC
+// layers. During the backward pass the ReLU receives a tensor produced by the
+// layer *after* it (nextOp). If there is an operator mismatch at the boundary
+// (one is GPU, the other is accel), we must use the accel operator because it
+// can handle both tensor types via ptrOf, whereas the GPU operator only
+// accepts *gputensor.Tensor.
+func (b *Benchmark) pickReluOp(
+	currentOp, nextOp, accelOp tensor.Operator,
+) tensor.Operator {
+	if currentOp == accelOp || nextOp == accelOp {
+		return accelOp
+	}
+
+	return currentOp
+}
+
 func (b *Benchmark) defineNetwork(gpuID int) {
 	context := b.driver.InitWithExistingPID(b.ctx)
 	b.driver.SelectGPU(context, gpuID)
-	to := gputensor.NewGPUOperator(b.driver, context)
 
+	gpuOp := gputensor.NewGPUOperator(b.driver, context)
 	if b.EnableVerification {
-		to.EnableVerification()
+		gpuOp.EnableVerification()
 	}
+
+	var accelOp tensor.Operator
+	if b.driver.GetNumAccelerators() > 0 && len(b.accelLayerSet) > 0 {
+		b.driver.SelectAccelerator(context, 0)
+		accelOp = acceltensor.NewOperator(b.driver, context)
+	} else {
+		accelOp = gpuOp
+	}
+
+	op0 := b.opForLayer(0, gpuOp, accelOp)
+	op2 := b.opForLayer(2, gpuOp, accelOp)
+	op4 := b.opForLayer(4, gpuOp, accelOp)
+	op6 := b.opForLayer(6, gpuOp, accelOp)
+
+	// ReLU layers use the operator of the *next* FC layer when there is a
+	// boundary crossing, because during backward pass the ReLU receives a
+	// tensor from the layer behind it. The accel operator can handle both
+	// tensor types via ptrOf/DeviceTensor, but the GPU operator cannot.
+	relu0Op := b.pickReluOp(op0, op2, accelOp)
+	relu2Op := b.pickReluOp(op2, op4, accelOp)
+	relu4Op := b.pickReluOp(op4, op6, accelOp)
 
 	network := training.Network{
 		Layers: []layers.Layer{
-			layers.NewFullyConnectedLayer(0, to, 784, 256),
-			layers.NewReluLayer(to),
-			layers.NewFullyConnectedLayer(2, to, 256, 100),
-			layers.NewReluLayer(to),
-			layers.NewFullyConnectedLayer(4, to, 100, 100),
-			layers.NewReluLayer(to),
-			layers.NewFullyConnectedLayer(6, to, 100, 10),
+			layers.NewFullyConnectedLayer(0, op0, 784, 256),
+			layers.NewReluLayer(relu0Op),
+			layers.NewFullyConnectedLayer(2, op2, 256, 100),
+			layers.NewReluLayer(relu2Op),
+			layers.NewFullyConnectedLayer(4, op4, 100, 100),
+			layers.NewReluLayer(relu4Op),
+			layers.NewFullyConnectedLayer(6, op6, 100, 10),
 		},
 	}
 
 	b.networks = append(b.networks, network)
 	b.contexts = append(b.contexts, context)
-	b.to = append(b.to, to)
+	b.to = append(b.to, gpuOp)
+	b.lastOp = append(b.lastOp, op6)
 }
 
 func (b *Benchmark) createTrainer() {
@@ -93,7 +185,7 @@ func (b *Benchmark) createTrainer() {
 	for i := 0; i < len(b.networks); i++ {
 		sources[i] = mnist.NewTrainingDataSource(b.to[i])
 		alg[i] = optimization.NewAdam(b.to[i], 0.001)
-		lossFuncs[i] = training.NewSoftmaxCrossEntropy(b.to[i])
+		lossFuncs[i] = training.NewSoftmaxCrossEntropy(b.lastOp[i])
 
 		if b.EnableTesting {
 			testers[i] = &training.Tester{

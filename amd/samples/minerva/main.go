@@ -15,9 +15,11 @@ var batchSizeFlag = flag.Int("batch-size", 32,
 var enableTestingFlag = flag.Bool("enable-testing", false,
 	"If set, the trainer will evaluate the trained model after each epoch")
 var enableVerification = flag.Bool("enable-verification", false,
-	`If set, all tenser operations will be verified against CPU results. Do not 
+	`If set, all tenser operations will be verified against CPU results. Do not
 turn on if you care about the final results. This flag will introduce extra
 GPU-to-CPU memory copies.`)
+var accelConfigPath = flag.String("accel-config", "",
+	"Path to accel_config.json for accelerator layer offloading.")
 
 func main() {
 	flag.Parse()
@@ -30,6 +32,7 @@ func main() {
 	benchmark.BatchSize = *batchSizeFlag
 	benchmark.EnableTesting = *enableTestingFlag
 	benchmark.EnableVerification = *enableVerification
+	benchmark.AccelConfigPath = *accelConfigPath
 
 	runner.AddBenchmark(benchmark)
 

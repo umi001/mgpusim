@@ -2,6 +2,7 @@ package acceltensor
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/tensor"
 	"github.com/sarchlab/mgpusim/v4/amd/driver"
@@ -61,17 +62,26 @@ func (o *Operator) CreateWithData(
 
 // Free releases the device memory for a tensor.
 func (o *Operator) Free(t tensor.Tensor) {
-	at := t.(*Tensor)
-	if at.ptr != 0 {
-		_ = o.driver.FreeMemory(o.ctx, at.ptr)
+	p := ptrOf(t)
+	if p != 0 {
+		_ = o.driver.FreeMemory(o.ctx, p)
 	}
+}
+
+// ptrOf extracts the device pointer from any tensor that implements
+// DeviceTensor (both acceltensor.Tensor and gputensor.Tensor).
+func ptrOf(t tensor.Tensor) driver.Ptr {
+	if dt, ok := t.(tensor.DeviceTensor); ok {
+		return dt.Ptr()
+	}
+
+	panic("acceltensor: tensor does not implement DeviceTensor")
 }
 
 // Copy copies data from src to dst tensor.
 func (o *Operator) Copy(dst, src tensor.Tensor) {
-	d := dst.(*Tensor)
-	s := src.(*Tensor)
-	o.driver.MemCopyD2D(o.ctx, d.ptr, s.ptr, s.NumElement()*sizeOfFloat32)
+	o.driver.MemCopyD2D(o.ctx, ptrOf(dst), ptrOf(src),
+		src.NumElement()*sizeOfFloat32)
 }
 
 // Clone duplicates a tensor.
@@ -90,22 +100,20 @@ func (o *Operator) Dump(t tensor.Tensor) string {
 
 // Init initializes tensor with float64 data from host.
 func (o *Operator) Init(t tensor.Tensor, data []float64) {
-	at := t.(*Tensor)
 	f32 := make([]float32, len(data))
 	for i, v := range data {
 		f32[i] = float32(v)
 	}
-	o.driver.MemCopyH2D(o.ctx, at.ptr, f32)
+	o.driver.MemCopyH2D(o.ctx, ptrOf(t), f32)
 }
 
 // Slice creates a tensor that shares part of the underlying buffer.
 func (o *Operator) Slice(t tensor.Tensor, start, end int) tensor.Tensor {
-	at := t.(*Tensor)
 	return &Tensor{
 		driver: o.driver,
 		ctx:    o.ctx,
 		size:   []int{end - start},
-		ptr:    at.ptr + driver.Ptr(start*sizeOfFloat32),
+		ptr:    ptrOf(t) + driver.Ptr(start*sizeOfFloat32),
 	}
 }
 
@@ -127,7 +135,7 @@ func (o *Operator) Repeat(t tensor.Tensor, times int) tensor.Tensor {
 // Clear sets all elements to 0.
 func (o *Operator) Clear(t tensor.Tensor) {
 	zeros := make([]float32, t.NumElement())
-	o.driver.MemCopyH2D(o.ctx, t.(*Tensor).ptr, zeros)
+	o.driver.MemCopyH2D(o.ctx, ptrOf(t), zeros)
 }
 
 // Zeros creates a zero-filled tensor.
@@ -152,14 +160,11 @@ func (o *Operator) Gemm(
 	alpha, beta float64,
 	a, b, c tensor.Tensor,
 ) tensor.Tensor {
-	aT, bT, cT := a.(*Tensor), b.(*Tensor), c.(*Tensor)
-
 	m := uint32(a.Size()[0])
 	k := uint32(a.Size()[1])
 	n := uint32(b.Size()[1])
 
 	out := o.Clone(c)
-	outT := out.(*Tensor)
 
 	params := protocol.AccelOpParams{
 		M: m, N: n, K: k,
@@ -173,10 +178,10 @@ func (o *Operator) Gemm(
 		o.ctx,
 		protocol.AccelOpGEMM,
 		params,
-		uint64(aT.ptr),
-		uint64(outT.ptr),
-		uint64(bT.ptr),
-		uint64(cT.ptr),
+		uint64(ptrOf(a)),
+		uint64(ptrOf(out)),
+		uint64(ptrOf(b)),
+		uint64(ptrOf(c)),
 		[4]uint32{m, k, 1, 1},
 		[4]uint32{m, n, 1, 1},
 		[4]uint32{k, n, 1, 1},
@@ -224,9 +229,17 @@ func (o *Operator) Dilate(t tensor.Tensor, dilate []int) tensor.Tensor {
 }
 
 // Sum calculates sums over given axes.
+// TODO: Replace host-side fallback with AccelInference dispatch
+// for timing-accurate simulation.
 func (o *Operator) Sum(t tensor.Tensor, axis []int) tensor.Tensor {
-	// TODO: Dispatch as AccelOpElementWise reduction.
-	panic("acceltensor: Sum not yet implemented")
+	cpuOp := tensor.CPUOperator{}
+	cpuIn := cpuOp.CreateWithData(t.Vector(), t.Size(), t.Descriptor())
+	cpuOut := cpuOp.Sum(cpuIn, axis)
+
+	out := o.Create(cpuOut.Size())
+	o.Init(out, cpuOut.Vector())
+
+	return out
 }
 
 // MaxPoolingForward performs max pooling forward pass.
@@ -266,76 +279,217 @@ func (o *Operator) AvgPoolingBackward(
 }
 
 // Softmax computes softmax.
+// TODO: Replace host-side fallback with AccelInference dispatch
+// for timing-accurate simulation.
 func (o *Operator) Softmax(t tensor.Tensor) tensor.Tensor {
-	// TODO: Dispatch as AccelOpSoftmax.
-	panic("acceltensor: Softmax not yet implemented")
+	size := t.Size()
+	inData := t.Vector()
+	outData := make([]float64, len(inData))
+
+	for i := 0; i < size[0]; i++ {
+		start := i * size[1]
+		end := start + size[1]
+
+		sum := 0.0
+		for j := start; j < end; j++ {
+			sum += math.Exp(inData[j])
+		}
+
+		for j := start; j < end; j++ {
+			outData[j] = math.Exp(inData[j]) / sum
+		}
+	}
+
+	out := o.Create(size)
+	o.Init(out, outData)
+
+	return out
 }
 
 // CrossEntropy computes cross entropy loss.
+// TODO: Replace host-side fallback with AccelInference dispatch
+// for timing-accurate simulation.
 func (o *Operator) CrossEntropy(t tensor.Tensor, label []int) float64 {
-	// TODO: Implement — may run on host or accelerator.
-	panic("acceltensor: CrossEntropy not yet implemented")
+	size := t.Size()
+	data := t.Vector()
+
+	loss := 0.0
+	for i := 0; i < size[0]; i++ {
+		idx := i*size[1] + label[i]
+		loss += -math.Log(data[idx])
+	}
+
+	return loss / float64(size[0])
 }
 
 // CrossEntropyDerivative computes cross entropy derivative.
+// TODO: Replace host-side fallback with AccelInference dispatch
+// for timing-accurate simulation.
 func (o *Operator) CrossEntropyDerivative(
 	t tensor.Tensor, label []int,
 ) tensor.Tensor {
-	// TODO: Implement.
-	panic("acceltensor: CrossEntropyDerivative not yet implemented")
+	size := t.Size()
+	inData := t.Vector()
+	outData := make([]float64, len(inData))
+
+	for i := 0; i < size[0]; i++ {
+		idx := i*size[1] + label[i]
+		outData[idx] = -1 / inData[idx]
+	}
+
+	out := o.Create(size)
+	o.Init(out, outData)
+
+	return out
 }
 
 // SoftmaxCrossEntropyDerivative computes fused softmax + cross entropy
 // derivative.
+// TODO: Replace host-side fallback with AccelInference dispatch
+// for timing-accurate simulation.
 func (o *Operator) SoftmaxCrossEntropyDerivative(
 	t tensor.Tensor, label []int,
 ) tensor.Tensor {
-	// TODO: Implement.
-	panic("acceltensor: SoftmaxCrossEntropyDerivative not yet implemented")
+	inData := t.Vector()
+	size := t.Size()
+	outData := make([]float64, len(inData))
+
+	for i := 0; i < size[0]; i++ {
+		for j := 0; j < size[1]; j++ {
+			idx := i*size[1] + j
+			if label[i] == j {
+				outData[idx] = inData[idx] - 1
+			} else {
+				outData[idx] = inData[idx]
+			}
+		}
+	}
+
+	out := o.Create(size)
+	o.Init(out, outData)
+
+	return out
 }
 
 // ElementWiseMul performs element-wise multiplication.
+// TODO: Replace host-side fallback with AccelInference dispatch
+// for timing-accurate simulation.
 func (o *Operator) ElementWiseMul(t1, t2 tensor.Tensor) tensor.Tensor {
-	// TODO: Dispatch as AccelOpElementWise.
-	panic("acceltensor: ElementWiseMul not yet implemented")
+	d1 := t1.Vector()
+	d2 := t2.Vector()
+	outData := make([]float64, len(d1))
+
+	for i := range d1 {
+		outData[i] = d1[i] * d2[i]
+	}
+
+	out := o.Create(t1.Size())
+	o.Init(out, outData)
+
+	return out
 }
 
 // ScaleAdd performs alpha*A + beta*B.
+// TODO: Replace host-side fallback with AccelInference dispatch
+// for timing-accurate simulation.
 func (o *Operator) ScaleAdd(
 	alpha, beta float64, a, b tensor.Tensor,
 ) tensor.Tensor {
-	// TODO: Dispatch as AccelOpElementWise.
-	panic("acceltensor: ScaleAdd not yet implemented")
+	da := a.Vector()
+	db := b.Vector()
+	outData := make([]float64, len(da))
+
+	for i := range da {
+		outData[i] = alpha*da[i] + beta*db[i]
+	}
+
+	out := o.Create(a.Size())
+	o.Init(out, outData)
+
+	return out
 }
 
 // RMSProp runs the RMSProp optimization step.
+// TODO: Replace host-side fallback with AccelInference dispatch
+// for timing-accurate simulation.
 func (o *Operator) RMSProp(
 	params, gradient, sHistory tensor.Tensor,
 	smoothFactor, learningRate float64,
 ) {
-	// TODO: Implement optimizer step on accelerator or host.
-	panic("acceltensor: RMSProp not yet implemented")
+	p := params.Vector()
+	g := gradient.Vector()
+	s := sHistory.Vector()
+
+	for i := range p {
+		s[i] = smoothFactor*s[i] + (1-smoothFactor)*g[i]*g[i]
+		p[i] -= learningRate * (1.0 / (math.Sqrt(s[i]*1e-8)) * g[i])
+	}
+
+	o.Init(params, p)
+	o.Init(sHistory, s)
 }
 
 // Adam runs the Adam optimization step.
+// TODO: Replace host-side fallback with AccelInference dispatch
+// for timing-accurate simulation.
 func (o *Operator) Adam(
 	params, gradients, vHistory, sHistory tensor.Tensor,
 	smoothFactor1, smoothFactor2, learningRate float64,
 ) {
-	// TODO: Implement optimizer step on accelerator or host.
-	panic("acceltensor: Adam not yet implemented")
+	p := params.Vector()
+	g := gradients.Vector()
+	v := vHistory.Vector()
+	s := sHistory.Vector()
+
+	for i := range p {
+		v[i] = smoothFactor1*v[i] + (1-smoothFactor1)*g[i]
+		s[i] = smoothFactor2*s[i] + (1-smoothFactor2)*g[i]*g[i]
+		p[i] -= learningRate * (1.0 / (math.Sqrt(s[i]) + 1e-8)) * v[i]
+	}
+
+	o.Init(params, p)
+	o.Init(vHistory, v)
+	o.Init(sHistory, s)
 }
 
 // ReluForward performs ReLU forward pass.
+// TODO: Replace host-side fallback with AccelInference dispatch
+// (AccelOpReLU) for timing-accurate simulation.
 func (o *Operator) ReluForward(in tensor.Tensor) tensor.Tensor {
-	// TODO: Dispatch as AccelOpReLU.
-	panic("acceltensor: ReluForward not yet implemented")
+	inData := in.Vector()
+	outData := make([]float64, len(inData))
+
+	for i, v := range inData {
+		if v > 0 {
+			outData[i] = v
+		}
+	}
+
+	out := o.Create(in.Size())
+	out.SetDescriptor(in.Descriptor())
+	o.Init(out, outData)
+
+	return out
 }
 
 // ReluBackward performs ReLU backward pass.
+// TODO: Replace host-side fallback with AccelInference dispatch
+// for timing-accurate simulation.
 func (o *Operator) ReluBackward(
 	forwardIn, backwardIn tensor.Tensor,
 ) tensor.Tensor {
-	// TODO: Implement ReLU backward on accelerator.
-	panic("acceltensor: ReluBackward not yet implemented")
+	fIn := forwardIn.Vector()
+	bIn := backwardIn.Vector()
+	outData := make([]float64, len(fIn))
+
+	for i := range outData {
+		if fIn[i] >= 0 {
+			outData[i] = bIn[i]
+		}
+	}
+
+	out := o.Create(forwardIn.Size())
+	o.Init(out, outData)
+
+	return out
 }
