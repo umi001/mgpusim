@@ -147,10 +147,21 @@ func (c *Comp) estimateCycles(
 		return c.estimatePoolingCycles(req)
 	case protocol.AccelOpReLU, protocol.AccelOpElementWise:
 		return c.estimateElementWiseCycles(req)
+	case protocol.AccelOpScaleAdd:
+		return c.estimateScaleAddCycles(req)
 	case protocol.AccelOpSoftmax:
 		return c.estimateSoftmaxCycles(req)
+	case protocol.AccelOpReduction:
+		return c.estimateReductionCycles(req)
+	case protocol.AccelOpAdam:
+		return c.estimateAdamCycles(req)
+	case protocol.AccelOpRMSProp:
+		return c.estimateRMSPropCycles(req)
+	case protocol.AccelOpCrossEntropy,
+		protocol.AccelOpCrossEntropyDeriv,
+		protocol.AccelOpSoftmaxCrossEntropyDeriv:
+		return c.estimateCrossEntropyCycles(req)
 	default:
-		// TODO: Add timing models for LayerNorm, attention, etc.
 		return 1000 // fallback
 	}
 }
@@ -243,13 +254,115 @@ func (c *Comp) estimateElementWiseCycles(
 func (c *Comp) estimateSoftmaxCycles(
 	req *protocol.AccelInferenceReq,
 ) int {
-	// TODO: Softmax requires exp + sum + div — model multi-pass.
+	// Softmax requires exp + sum + div — 3 passes over the data.
+	// Memory-bound: each pass reads one element per cycle per vector lane.
 	totalElements := int(req.InputSize[0]) *
 		int(req.InputSize[1]) *
 		int(req.InputSize[2]) *
 		int(req.InputSize[3])
-	// 3 passes over data (exp, sum, div)
-	return 3 * totalElements / c.peArrayCols
+	cycles := 3 * totalElements / c.peArrayCols
+	if cycles < 1 {
+		cycles = 1
+	}
+
+	return cycles
+}
+
+// estimateScaleAddCycles models alpha*A + beta*B.
+// Reads 2 input tensors, writes 1 output tensor = 3 memory passes.
+// Compute is trivial (1 multiply-add per element), so memory-bound.
+func (c *Comp) estimateScaleAddCycles(
+	req *protocol.AccelInferenceReq,
+) int {
+	totalElements := int(req.InputSize[0]) *
+		int(req.InputSize[1]) *
+		int(req.InputSize[2]) *
+		int(req.InputSize[3])
+	// 2 reads + 1 write = 3 memory passes, each limited by vector width
+	cycles := 3 * totalElements / c.peArrayCols
+	if cycles < 1 {
+		cycles = 1
+	}
+
+	return cycles
+}
+
+// estimateReductionCycles models a sum reduction over one or more axes.
+// First pass reads all input elements, then a log-tree reduction.
+// Memory-bound on the read side.
+func (c *Comp) estimateReductionCycles(
+	req *protocol.AccelInferenceReq,
+) int {
+	inputElements := int(req.InputSize[0]) *
+		int(req.InputSize[1]) *
+		int(req.InputSize[2]) *
+		int(req.InputSize[3])
+	// Read all inputs + partial sums tree (dominated by the read pass)
+	cycles := inputElements / c.peArrayCols
+	if cycles < 1 {
+		cycles = 1
+	}
+
+	return cycles
+}
+
+// estimateAdamCycles models one Adam optimizer step.
+// Per element: reads params, gradients, vHistory, sHistory (4 reads),
+// computes updated values, writes params, vHistory, sHistory (3 writes).
+// Total memory traffic = 7 tensor passes. Compute is trivial per element.
+func (c *Comp) estimateAdamCycles(
+	req *protocol.AccelInferenceReq,
+) int {
+	totalElements := int(req.InputSize[0]) *
+		int(req.InputSize[1]) *
+		int(req.InputSize[2]) *
+		int(req.InputSize[3])
+	// 4 reads + 3 writes = 7 memory passes
+	cycles := 7 * totalElements / c.peArrayCols
+	if cycles < 1 {
+		cycles = 1
+	}
+
+	return cycles
+}
+
+// estimateRMSPropCycles models one RMSProp optimizer step.
+// Per element: reads params, gradients, sHistory (3 reads),
+// writes params, sHistory (2 writes).
+// Total memory traffic = 5 tensor passes.
+func (c *Comp) estimateRMSPropCycles(
+	req *protocol.AccelInferenceReq,
+) int {
+	totalElements := int(req.InputSize[0]) *
+		int(req.InputSize[1]) *
+		int(req.InputSize[2]) *
+		int(req.InputSize[3])
+	// 3 reads + 2 writes = 5 memory passes
+	cycles := 5 * totalElements / c.peArrayCols
+	if cycles < 1 {
+		cycles = 1
+	}
+
+	return cycles
+}
+
+// estimateCrossEntropyCycles models cross-entropy loss and its derivatives.
+// These touch batch_size * num_classes elements with simple per-element ops.
+// Memory-bound: 1 read pass + 1 write pass (derivatives) or read-only (loss).
+func (c *Comp) estimateCrossEntropyCycles(
+	req *protocol.AccelInferenceReq,
+) int {
+	totalElements := int(req.InputSize[0]) *
+		int(req.InputSize[1]) *
+		int(req.InputSize[2]) *
+		int(req.InputSize[3])
+	// 1 read + 1 write for derivatives, just 1 read for loss scalar
+	cycles := 2 * totalElements / c.peArrayCols
+	if cycles < 1 {
+		cycles = 1
+	}
+
+	return cycles
 }
 
 // processCurrentOp decrements the remaining cycles and completes the

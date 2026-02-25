@@ -152,6 +152,21 @@ func (o *Operator) Reshape(t tensor.Tensor, newSize []int) tensor.Tensor {
 	return out
 }
 
+// sizeToU32x4 encodes a tensor shape into the [4]uint32 format used by
+// AccelInferenceReq. Unused trailing dimensions are set to 1.
+func sizeToU32x4(size []int) [4]uint32 {
+	var s [4]uint32
+	for i := range s {
+		s[i] = 1
+	}
+
+	for i := 0; i < len(size) && i < 4; i++ {
+		s[i] = uint32(size[i])
+	}
+
+	return s
+}
+
 // ---- Operations dispatched to accelerator ----
 
 // Gemm performs alpha * A * B + beta * C via the accelerator.
@@ -190,51 +205,16 @@ func (o *Operator) Gemm(
 	return out
 }
 
-// Im2Col performs the im2col transformation via the accelerator.
+// Im2Col performs the im2col transformation.
+// This is a data layout transformation (no arithmetic), so it runs on the
+// CPU and copies the result to device memory. No accelerator dispatch.
 func (o *Operator) Im2Col(
 	t tensor.Tensor,
 	kernelSize, padding, stride, dilation []int,
 ) tensor.Tensor {
-	// TODO: Dispatch to accelerator with AccelOpConv2D or a dedicated
-	// im2col op type. For now, fall back to CPU implementation.
-	//
-	// A full implementation would:
-	//   1. Compute output dimensions
-	//   2. Allocate output tensor
-	//   3. Send AccelInferenceReq with im2col parameters
-	//   4. Return the output tensor
-	panic("acceltensor: Im2Col not yet implemented — " +
-		"TODO: implement as accelerator op or CPU fallback")
-}
-
-// Transpose reorders tensor axes.
-func (o *Operator) Transpose(t tensor.Tensor, order []int) tensor.Tensor {
-	// TODO: Dispatch to accelerator or implement via memory reshuffling.
-	// Transpose is typically memory-bound and may be better on the
-	// accelerator's DMA engine.
-	panic("acceltensor: Transpose not yet implemented — " +
-		"TODO: implement as accelerator op or CPU fallback")
-}
-
-// Rotate180 rotates the lowest-level matrices by 180 degrees.
-func (o *Operator) Rotate180(t tensor.Tensor) tensor.Tensor {
-	// TODO: Implement — used in conv2d backward pass.
-	panic("acceltensor: Rotate180 not yet implemented")
-}
-
-// Dilate adds zeros between elements.
-func (o *Operator) Dilate(t tensor.Tensor, dilate []int) tensor.Tensor {
-	// TODO: Implement — used in conv2d backward pass.
-	panic("acceltensor: Dilate not yet implemented")
-}
-
-// Sum calculates sums over given axes.
-// TODO: Replace host-side fallback with AccelInference dispatch
-// for timing-accurate simulation.
-func (o *Operator) Sum(t tensor.Tensor, axis []int) tensor.Tensor {
 	cpuOp := tensor.CPUOperator{}
 	cpuIn := cpuOp.CreateWithData(t.Vector(), t.Size(), t.Descriptor())
-	cpuOut := cpuOp.Sum(cpuIn, axis)
+	cpuOut := cpuOp.Im2Col(cpuIn, kernelSize, padding, stride, dilation)
 
 	out := o.Create(cpuOut.Size())
 	o.Init(out, cpuOut.Vector())
@@ -242,89 +222,235 @@ func (o *Operator) Sum(t tensor.Tensor, axis []int) tensor.Tensor {
 	return out
 }
 
+// Transpose reorders tensor axes.
+// This is a data layout transformation, so it runs on the CPU.
+func (o *Operator) Transpose(t tensor.Tensor, order []int) tensor.Tensor {
+	cpuOp := tensor.CPUOperator{}
+	cpuIn := cpuOp.CreateWithData(t.Vector(), t.Size(), t.Descriptor())
+	cpuOut := cpuOp.Transpose(cpuIn, order)
+
+	out := o.Create(cpuOut.Size())
+	out.SetDescriptor(cpuOut.Descriptor())
+	o.Init(out, cpuOut.Vector())
+
+	return out
+}
+
+// Rotate180 rotates the lowest-level matrices by 180 degrees.
+// Used in conv2d backward pass. Runs on CPU.
+func (o *Operator) Rotate180(t tensor.Tensor) tensor.Tensor {
+	cpuOp := tensor.CPUOperator{}
+	cpuIn := cpuOp.CreateWithData(t.Vector(), t.Size(), t.Descriptor())
+	cpuOut := cpuOp.Rotate180(cpuIn)
+
+	out := o.Create(cpuOut.Size())
+	o.Init(out, cpuOut.Vector())
+
+	return out
+}
+
+// Dilate adds zeros between elements.
+// Used in conv2d backward pass. Runs on CPU.
+func (o *Operator) Dilate(t tensor.Tensor, dilate []int) tensor.Tensor {
+	cpuOp := tensor.CPUOperator{}
+	cpuIn := cpuOp.CreateWithData(t.Vector(), t.Size(), t.Descriptor())
+	cpuOut := cpuOp.Dilate(cpuIn, dilate)
+
+	out := o.Create(cpuOut.Size())
+	o.Init(out, cpuOut.Vector())
+
+	return out
+}
+
+// Sum calculates sums over given axes via the accelerator.
+func (o *Operator) Sum(t tensor.Tensor, axis []int) tensor.Tensor {
+	// Functional computation on CPU.
+	cpuOp := tensor.CPUOperator{}
+	cpuIn := cpuOp.CreateWithData(t.Vector(), t.Size(), t.Descriptor())
+	cpuOut := cpuOp.Sum(cpuIn, axis)
+
+	out := o.Create(cpuOut.Size())
+	o.Init(out, cpuOut.Vector())
+
+	// Dispatch to accelerator for timing.
+	// The reduction reads all input elements and writes a smaller output.
+	inSize := sizeToU32x4(t.Size())
+	outSize := sizeToU32x4(cpuOut.Size())
+
+	o.driver.AccelInference(
+		o.ctx,
+		protocol.AccelOpReduction,
+		protocol.AccelOpParams{},
+		uint64(ptrOf(t)),
+		uint64(ptrOf(out)),
+		0, 0,
+		inSize, outSize, [4]uint32{},
+	)
+
+	return out
+}
+
 // MaxPoolingForward performs max pooling forward pass.
+// Runs on CPU — pooling is not dispatched to the systolic array.
 func (o *Operator) MaxPoolingForward(
 	t tensor.Tensor,
 	kernelSize, padding, stride []int,
 ) (tensor.Tensor, tensor.Tensor) {
-	// TODO: Dispatch as AccelOpMaxPool.
-	panic("acceltensor: MaxPoolingForward not yet implemented")
+	cpuOp := tensor.CPUOperator{}
+	cpuIn := cpuOp.CreateWithData(t.Vector(), t.Size(), t.Descriptor())
+	cpuOut, cpuMask := cpuOp.MaxPoolingForward(
+		cpuIn, kernelSize, padding, stride)
+
+	out := o.Create(cpuOut.Size())
+	o.Init(out, cpuOut.Vector())
+
+	mask := o.Create(cpuMask.Size())
+	o.Init(mask, cpuMask.Vector())
+
+	return out, mask
 }
 
 // MaxPoolingBackward performs max pooling backward pass.
+// Runs on CPU.
 func (o *Operator) MaxPoolingBackward(
 	forwardIn, backwardIn, mask tensor.Tensor,
 	kernelSize, padding, stride []int,
 ) tensor.Tensor {
-	// TODO: Implement backward pass for max pooling.
-	panic("acceltensor: MaxPoolingBackward not yet implemented")
+	cpuOp := tensor.CPUOperator{}
+	cpuFwd := cpuOp.CreateWithData(
+		forwardIn.Vector(), forwardIn.Size(), "")
+	cpuBwd := cpuOp.CreateWithData(
+		backwardIn.Vector(), backwardIn.Size(), "")
+	cpuMask := cpuOp.CreateWithData(
+		mask.Vector(), mask.Size(), "")
+	cpuOut := cpuOp.MaxPoolingBackward(
+		cpuFwd, cpuBwd, cpuMask, kernelSize, padding, stride)
+
+	out := o.Create(cpuOut.Size())
+	o.Init(out, cpuOut.Vector())
+
+	return out
 }
 
 // AvgPoolingForward performs average pooling forward pass.
+// Runs on CPU.
 func (o *Operator) AvgPoolingForward(
 	t tensor.Tensor,
 	kernelSize, padding, stride []int,
 ) tensor.Tensor {
-	// TODO: Dispatch as AccelOpAvgPool.
-	panic("acceltensor: AvgPoolingForward not yet implemented")
+	cpuOp := tensor.CPUOperator{}
+	cpuIn := cpuOp.CreateWithData(t.Vector(), t.Size(), t.Descriptor())
+	cpuOut := cpuOp.AvgPoolingForward(
+		cpuIn, kernelSize, padding, stride)
+
+	out := o.Create(cpuOut.Size())
+	o.Init(out, cpuOut.Vector())
+
+	return out
 }
 
 // AvgPoolingBackward performs average pooling backward pass.
+// Runs on CPU.
 func (o *Operator) AvgPoolingBackward(
 	forwardIn, backwardIn tensor.Tensor,
 	kernelSize, padding, stride []int,
 ) tensor.Tensor {
-	// TODO: Implement backward pass for avg pooling.
-	panic("acceltensor: AvgPoolingBackward not yet implemented")
+	cpuOp := tensor.CPUOperator{}
+	cpuFwd := cpuOp.CreateWithData(
+		forwardIn.Vector(), forwardIn.Size(), "")
+	cpuBwd := cpuOp.CreateWithData(
+		backwardIn.Vector(), backwardIn.Size(), "")
+	cpuOut := cpuOp.AvgPoolingBackward(
+		cpuFwd, cpuBwd, kernelSize, padding, stride)
+
+	out := o.Create(cpuOut.Size())
+	o.Init(out, cpuOut.Vector())
+
+	return out
 }
 
-// Softmax computes softmax.
-// TODO: Replace host-side fallback with AccelInference dispatch
-// for timing-accurate simulation.
+// Softmax computes softmax via the accelerator.
 func (o *Operator) Softmax(t tensor.Tensor) tensor.Tensor {
 	size := t.Size()
 	inData := t.Vector()
 	outData := make([]float64, len(inData))
 
+	// Functional computation: per-row softmax with numerical stability.
 	for i := 0; i < size[0]; i++ {
 		start := i * size[1]
 		end := start + size[1]
 
+		// Find max for numerical stability.
+		maxVal := inData[start]
+		for j := start + 1; j < end; j++ {
+			if inData[j] > maxVal {
+				maxVal = inData[j]
+			}
+		}
+
 		sum := 0.0
 		for j := start; j < end; j++ {
-			sum += math.Exp(inData[j])
+			sum += math.Exp(inData[j] - maxVal)
 		}
 
 		for j := start; j < end; j++ {
-			outData[j] = math.Exp(inData[j]) / sum
+			outData[j] = math.Exp(inData[j]-maxVal) / sum
 		}
 	}
 
 	out := o.Create(size)
 	o.Init(out, outData)
 
+	// Dispatch to accelerator for timing.
+	inSize := sizeToU32x4(size)
+
+	o.driver.AccelInference(
+		o.ctx,
+		protocol.AccelOpSoftmax,
+		protocol.AccelOpParams{},
+		uint64(ptrOf(t)),
+		uint64(ptrOf(out)),
+		0, 0,
+		inSize, inSize, [4]uint32{},
+	)
+
 	return out
 }
 
-// CrossEntropy computes cross entropy loss.
-// TODO: Replace host-side fallback with AccelInference dispatch
-// for timing-accurate simulation.
+// CrossEntropy computes cross entropy loss via the accelerator.
+// Returns a scalar (float64). The accelerator dispatch models the time to
+// read the prediction tensor and compute the per-sample log-loss.
 func (o *Operator) CrossEntropy(t tensor.Tensor, label []int) float64 {
 	size := t.Size()
 	data := t.Vector()
 
+	// Functional computation on CPU.
 	loss := 0.0
 	for i := 0; i < size[0]; i++ {
 		idx := i*size[1] + label[i]
 		loss += -math.Log(data[idx])
 	}
 
-	return loss / float64(size[0])
+	loss /= float64(size[0])
+
+	// Dispatch to accelerator for timing.
+	// Cross-entropy reads the full prediction tensor (batch × classes).
+	inSize := sizeToU32x4(size)
+
+	o.driver.AccelInference(
+		o.ctx,
+		protocol.AccelOpCrossEntropy,
+		protocol.AccelOpParams{},
+		uint64(ptrOf(t)),
+		0, 0, 0,
+		inSize, [4]uint32{1, 1, 1, 1}, [4]uint32{},
+	)
+
+	return loss
 }
 
-// CrossEntropyDerivative computes cross entropy derivative.
-// TODO: Replace host-side fallback with AccelInference dispatch
-// for timing-accurate simulation.
+// CrossEntropyDerivative computes cross entropy derivative via the
+// accelerator.
 func (o *Operator) CrossEntropyDerivative(
 	t tensor.Tensor, label []int,
 ) tensor.Tensor {
@@ -332,6 +458,7 @@ func (o *Operator) CrossEntropyDerivative(
 	inData := t.Vector()
 	outData := make([]float64, len(inData))
 
+	// Functional computation on CPU.
 	for i := 0; i < size[0]; i++ {
 		idx := i*size[1] + label[i]
 		outData[idx] = -1 / inData[idx]
@@ -340,13 +467,24 @@ func (o *Operator) CrossEntropyDerivative(
 	out := o.Create(size)
 	o.Init(out, outData)
 
+	// Dispatch to accelerator for timing.
+	inSize := sizeToU32x4(size)
+
+	o.driver.AccelInference(
+		o.ctx,
+		protocol.AccelOpCrossEntropyDeriv,
+		protocol.AccelOpParams{},
+		uint64(ptrOf(t)),
+		uint64(ptrOf(out)),
+		0, 0,
+		inSize, inSize, [4]uint32{},
+	)
+
 	return out
 }
 
 // SoftmaxCrossEntropyDerivative computes fused softmax + cross entropy
-// derivative.
-// TODO: Replace host-side fallback with AccelInference dispatch
-// for timing-accurate simulation.
+// derivative via the accelerator.
 func (o *Operator) SoftmaxCrossEntropyDerivative(
 	t tensor.Tensor, label []int,
 ) tensor.Tensor {
@@ -354,6 +492,7 @@ func (o *Operator) SoftmaxCrossEntropyDerivative(
 	size := t.Size()
 	outData := make([]float64, len(inData))
 
+	// Functional computation on CPU.
 	for i := 0; i < size[0]; i++ {
 		for j := 0; j < size[1]; j++ {
 			idx := i*size[1] + j
@@ -368,13 +507,25 @@ func (o *Operator) SoftmaxCrossEntropyDerivative(
 	out := o.Create(size)
 	o.Init(out, outData)
 
+	// Dispatch to accelerator for timing.
+	inSize := sizeToU32x4(size)
+
+	o.driver.AccelInference(
+		o.ctx,
+		protocol.AccelOpSoftmaxCrossEntropyDeriv,
+		protocol.AccelOpParams{},
+		uint64(ptrOf(t)),
+		uint64(ptrOf(out)),
+		0, 0,
+		inSize, inSize, [4]uint32{},
+	)
+
 	return out
 }
 
-// ElementWiseMul performs element-wise multiplication.
-// TODO: Replace host-side fallback with AccelInference dispatch
-// for timing-accurate simulation.
+// ElementWiseMul performs element-wise multiplication via the accelerator.
 func (o *Operator) ElementWiseMul(t1, t2 tensor.Tensor) tensor.Tensor {
+	// Functional computation on CPU.
 	d1 := t1.Vector()
 	d2 := t2.Vector()
 	outData := make([]float64, len(d1))
@@ -386,15 +537,28 @@ func (o *Operator) ElementWiseMul(t1, t2 tensor.Tensor) tensor.Tensor {
 	out := o.Create(t1.Size())
 	o.Init(out, outData)
 
+	// Dispatch to accelerator for timing.
+	inSize := sizeToU32x4(t1.Size())
+
+	o.driver.AccelInference(
+		o.ctx,
+		protocol.AccelOpElementWise,
+		protocol.AccelOpParams{},
+		uint64(ptrOf(t1)),
+		uint64(ptrOf(out)),
+		uint64(ptrOf(t2)),
+		0,
+		inSize, inSize, inSize,
+	)
+
 	return out
 }
 
-// ScaleAdd performs alpha*A + beta*B.
-// TODO: Replace host-side fallback with AccelInference dispatch
-// for timing-accurate simulation.
+// ScaleAdd performs alpha*A + beta*B via the accelerator.
 func (o *Operator) ScaleAdd(
 	alpha, beta float64, a, b tensor.Tensor,
 ) tensor.Tensor {
+	// Functional computation on CPU for correctness.
 	da := a.Vector()
 	db := b.Vector()
 	outData := make([]float64, len(da))
@@ -406,16 +570,30 @@ func (o *Operator) ScaleAdd(
 	out := o.Create(a.Size())
 	o.Init(out, outData)
 
+	// Dispatch to accelerator for timing.
+	inSize := sizeToU32x4(a.Size())
+
+	o.driver.AccelInference(
+		o.ctx,
+		protocol.AccelOpScaleAdd,
+		protocol.AccelOpParams{Alpha: alpha, Beta: beta},
+		uint64(ptrOf(a)),
+		uint64(ptrOf(out)),
+		uint64(ptrOf(b)),
+		0,
+		inSize, inSize, inSize,
+	)
+
 	return out
 }
 
-// RMSProp runs the RMSProp optimization step.
-// TODO: Replace host-side fallback with AccelInference dispatch
-// for timing-accurate simulation.
+// RMSProp runs the RMSProp optimization step via the accelerator.
+// Updates params and sHistory in-place.
 func (o *Operator) RMSProp(
 	params, gradient, sHistory tensor.Tensor,
 	smoothFactor, learningRate float64,
 ) {
+	// Functional computation on CPU.
 	p := params.Vector()
 	g := gradient.Vector()
 	s := sHistory.Vector()
@@ -427,15 +605,34 @@ func (o *Operator) RMSProp(
 
 	o.Init(params, p)
 	o.Init(sHistory, s)
+
+	// Dispatch to accelerator for timing.
+	// RMSProp reads 3 tensors (params, gradient, sHistory) and writes 2
+	// (params, sHistory). Memory-bound.
+	inSize := sizeToU32x4(params.Size())
+
+	o.driver.AccelInference(
+		o.ctx,
+		protocol.AccelOpRMSProp,
+		protocol.AccelOpParams{
+			Alpha: smoothFactor,
+			Beta:  learningRate,
+		},
+		uint64(ptrOf(params)),
+		uint64(ptrOf(sHistory)),
+		uint64(ptrOf(gradient)),
+		0,
+		inSize, inSize, inSize,
+	)
 }
 
-// Adam runs the Adam optimization step.
-// TODO: Replace host-side fallback with AccelInference dispatch
-// for timing-accurate simulation.
+// Adam runs the Adam optimization step via the accelerator.
+// Updates params, vHistory, and sHistory in-place.
 func (o *Operator) Adam(
 	params, gradients, vHistory, sHistory tensor.Tensor,
 	smoothFactor1, smoothFactor2, learningRate float64,
 ) {
+	// Functional computation on CPU.
 	p := params.Vector()
 	g := gradients.Vector()
 	v := vHistory.Vector()
@@ -450,12 +647,30 @@ func (o *Operator) Adam(
 	o.Init(params, p)
 	o.Init(vHistory, v)
 	o.Init(sHistory, s)
+
+	// Dispatch to accelerator for timing.
+	// Adam reads 4 tensors (params, gradients, vHistory, sHistory) and
+	// writes 3 (params, vHistory, sHistory). Memory-bound.
+	inSize := sizeToU32x4(params.Size())
+
+	o.driver.AccelInference(
+		o.ctx,
+		protocol.AccelOpAdam,
+		protocol.AccelOpParams{
+			Alpha: smoothFactor1,
+			Beta:  learningRate,
+		},
+		uint64(ptrOf(params)),
+		uint64(ptrOf(vHistory)),
+		uint64(ptrOf(gradients)),
+		uint64(ptrOf(sHistory)),
+		inSize, inSize, inSize,
+	)
 }
 
-// ReluForward performs ReLU forward pass.
-// TODO: Replace host-side fallback with AccelInference dispatch
-// (AccelOpReLU) for timing-accurate simulation.
+// ReluForward performs ReLU forward pass via the accelerator.
 func (o *Operator) ReluForward(in tensor.Tensor) tensor.Tensor {
+	// Functional computation on CPU.
 	inData := in.Vector()
 	outData := make([]float64, len(inData))
 
@@ -469,15 +684,28 @@ func (o *Operator) ReluForward(in tensor.Tensor) tensor.Tensor {
 	out.SetDescriptor(in.Descriptor())
 	o.Init(out, outData)
 
+	// Dispatch to accelerator for timing.
+	inSize := sizeToU32x4(in.Size())
+
+	o.driver.AccelInference(
+		o.ctx,
+		protocol.AccelOpReLU,
+		protocol.AccelOpParams{},
+		uint64(ptrOf(in)),
+		uint64(ptrOf(out)),
+		0, 0,
+		inSize, inSize, [4]uint32{},
+	)
+
 	return out
 }
 
-// ReluBackward performs ReLU backward pass.
-// TODO: Replace host-side fallback with AccelInference dispatch
-// for timing-accurate simulation.
+// ReluBackward performs ReLU backward pass via the accelerator.
+// The backward pass applies the same mask as forward (zero where input < 0).
 func (o *Operator) ReluBackward(
 	forwardIn, backwardIn tensor.Tensor,
 ) tensor.Tensor {
+	// Functional computation on CPU.
 	fIn := forwardIn.Vector()
 	bIn := backwardIn.Vector()
 	outData := make([]float64, len(fIn))
@@ -490,6 +718,20 @@ func (o *Operator) ReluBackward(
 
 	out := o.Create(forwardIn.Size())
 	o.Init(out, outData)
+
+	// Dispatch to accelerator for timing — same cost as forward (element-wise).
+	inSize := sizeToU32x4(forwardIn.Size())
+
+	o.driver.AccelInference(
+		o.ctx,
+		protocol.AccelOpReLU,
+		protocol.AccelOpParams{},
+		uint64(ptrOf(forwardIn)),
+		uint64(ptrOf(out)),
+		uint64(ptrOf(backwardIn)),
+		0,
+		inSize, inSize, inSize,
+	)
 
 	return out
 }

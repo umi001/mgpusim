@@ -20,8 +20,13 @@ const (
 	AccelOpGEMM
 	AccelOpLayerNorm
 	AccelOpElementWise
-	// TODO: Add more operation types as needed (e.g., attention, transpose,
-	// batch norm, etc.)
+	AccelOpScaleAdd                  // alpha*A + beta*B (2 input tensors)
+	AccelOpReduction                 // sum/mean reduction over axes
+	AccelOpAdam                      // Adam optimizer step (4 tensors in, 3 written)
+	AccelOpRMSProp                   // RMSProp optimizer step (3 tensors in, 2 written)
+	AccelOpCrossEntropy              // cross-entropy loss (read-only, scalar output)
+	AccelOpCrossEntropyDeriv         // cross-entropy derivative
+	AccelOpSoftmaxCrossEntropyDeriv  // fused softmax + cross-entropy derivative
 )
 
 // AccelOpParams holds the parameters for an accelerator operation.
