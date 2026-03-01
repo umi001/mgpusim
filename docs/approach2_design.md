@@ -446,6 +446,112 @@ Additionally, the `Softmax` implementation was improved with numerical
 stability (max-subtraction before exponentiation), which prevents overflow
 for large logit values that occur in real transformer attention patterns.
 
+### 5.6 Phase 2: Memory Hierarchy Wiring and Roofline Model
+
+Phase 2 addresses the most significant gap in the timing model: the
+accelerator's memory subsystem. Before Phase 2, all accelerator timing was
+purely compute-based — the `ToMem` port was disconnected, and the timing
+model only counted arithmetic cycles.
+
+#### The Problem
+
+Real accelerators are frequently **memory-bound**, not compute-bound. A
+256×256 systolic array running at 1 GHz can perform 65,536 MACs/cycle —
+far more than the memory system can feed for most operations:
+
+- A ScaleAdd (alpha*A + beta*B) reads 2 tensors and writes 1 tensor. For a
+  768-element vector, that's 3 × 768 × 4 = 9,216 bytes of memory traffic.
+  At 256 bytes/cycle, that's 36 memory cycles vs. 3 compute cycles.
+  **12× memory-bound.**
+
+- A GEMM [128×768] × [768×768] requires 128×768×768 ≈ 75.5M MACs.
+  Compute cycles = 75.5M / 65,536 = 1,152 cycles.
+  Memory reads = (128×768 + 768×768) × 4 ≈ 2.75 MB; at 256 bytes/cycle
+  = 10,750 cycles. **9.3× memory-bound** (before data reuse from SRAM).
+
+Without memory modeling, the timing reports are unrealistically optimistic
+for memory-bound operations.
+
+#### Design: DMA-Based Memory Model
+
+Real fixed-function accelerators (Google TPU, Groq TSP) use **DMA engines**
+for bulk data transfers between off-chip DRAM and on-chip SRAM. The data
+flow for each operation is:
+
+```
+1. Driver sends command → "compute GEMM on tensor at address X"
+2. Accelerator DMA engine reads tensor from DRAM → on-chip SRAM (READ)
+3. Systolic array reads from SRAM, computes, writes result to SRAM
+4. DMA engine writes result from SRAM → DRAM (WRITE)
+5. Accelerator sends response → "done"
+```
+
+This is fundamentally different from how GPUs access memory — GPUs issue
+individual cache-line (64-byte) requests from each CU wavefront through
+L1/L2/DRAM. Accelerators perform bulk DMA transfers of entire tiles.
+
+We model this in three parts:
+
+1. **DRAM infrastructure**: Wire the accelerator's `ToMem` port to an
+   `idealmemcontroller` (same component used by GPUs) via a
+   `directconnection`. This puts the accelerator in the Akita simulation
+   framework's memory event system with a 100-cycle DRAM latency.
+
+2. **Analytical bandwidth model**: For each operation, compute the total
+   memory traffic (read bytes + write bytes) based on the op type and tensor
+   dimensions. Calculate `mem_cycles = total_bytes / memBandwidthBW` where
+   `memBandwidthBW` = 256 bytes/cycle (configurable).
+
+3. **Roofline execution**: `total_cycles = max(compute_cycles, mem_cycles)`.
+   The accelerator issues one `mem.ReadReq` per input tensor through `ToMem`
+   for DRAM latency modeling, then counts down the roofline cycles, then
+   issues a `mem.WriteReq` for the output. This gives a three-phase
+   execution: READ → COMPUTE → WRITE.
+
+The roofline model (`latency = max(compute, memory)`) is the standard
+analytical model used in architecture research (Williams et al., 2009).
+It captures the fundamental bottleneck — whether the operation is limited
+by arithmetic throughput or memory bandwidth — without requiring detailed
+microarchitectural simulation.
+
+#### Memory Traffic Per Operation Type
+
+| Operation | Read bytes | Write bytes | Bottleneck |
+|-----------|-----------|-------------|------------|
+| GEMM (M,N,K) | (M×K + K×N) × 4 | M×N × 4 | Usually compute for large K |
+| Conv2D | (batch×inC×H×W + outC×inC×kH×kW) × 4 | batch×outC×oH×oW × 4 | Compute |
+| ReLU/ElementWise | N × 4 | N × 4 | Memory |
+| ScaleAdd | 2×N × 4 | N × 4 | Memory |
+| Softmax | N × 4 | N × 4 | Memory |
+| Reduction/Sum | N × 4 | 4 (scalar) | Memory |
+| Adam | 4×N × 4 | 3×N × 4 | Memory |
+| RMSProp | 3×N × 4 | 2×N × 4 | Memory |
+| CrossEntropy | 2×N × 4 | N × 4 | Memory |
+
+N = total elements from tensor dimensions.
+
+#### What Phase 2 Does NOT Model (Future Work)
+
+- **SRAM capacity and tiling**: When total data exceeds the 32MB on-chip
+  SRAM, the operation must be tiled (broken into chunks that fit). Each tile
+  goes through a separate DMA-read → compute → DMA-write cycle. Tiling
+  increases total latency by `num_tiles` factor, partially mitigated by
+  double-buffering (prefetching tile N+1 while computing tile N).
+
+- **Double-buffering / compute-memory overlap**: Real accelerators pipeline
+  DMA transfers with computation. While computing on data in SRAM buffer A,
+  the DMA engine fills SRAM buffer B with the next tile. This overlap is
+  not modeled — we use a sequential READ → COMPUTE → WRITE pipeline.
+
+- **Per-cache-line memory transactions**: We issue one probe `ReadReq` per
+  tensor (64 bytes) for the DRAM latency event, not per cache line. The
+  bulk bandwidth is modeled analytically.
+
+- **DRAM bank conflicts and row buffer effects**: The `idealmemcontroller`
+  is ideal — every access takes exactly 100 cycles. A realistic DRAM
+  controller would model bank conflicts, row buffer hits/misses, and
+  scheduling policies.
+
 ## 6. What the Simulation Currently Captures
 
 ### Accurately modeled:
@@ -461,19 +567,32 @@ for large logit values that occur in real transformer attention patterns.
 - **Heterogeneous scheduling**: Which layers run where, configurable at
   runtime
 
-### Not yet modeled (Phase 2 scope):
-- **Accelerator memory access latency**: The accelerator's `ToMem` port is
-  not connected to any DRAM controller. All accelerator memory access is
-  "magic" — zero simulated latency.
-- **GPU-accelerator memory contention**: Since the accelerator doesn't
-  generate memory transactions, there's no contention on shared HBM.
-- **Accelerator SRAM capacity constraints**: The timing model doesn't check
+### Modeled after Phase 2:
+- **Accelerator DRAM access latency**: The accelerator's `ToMem` port is
+  wired to an `idealmemcontroller` with 100-cycle latency, connected via
+  `directconnection`. Each operation issues `mem.ReadReq`/`mem.WriteReq`
+  for DRAM round-trip timing.
+- **Bandwidth-limited memory traffic**: Analytical calculation of total
+  read/write bytes per operation. Memory cycles = total_bytes / bandwidth.
+- **Roofline model**: `total_cycles = max(compute_cycles, mem_cycles)`.
+  Memory-bound ops (ScaleAdd, Adam, Softmax) now correctly show higher
+  cycle counts than pure compute estimates.
+- **Memory traffic metrics**: Total read bytes and write bytes reported
+  per accelerator in the SQLite metrics database.
+
+### Not yet modeled (future work):
+- **SRAM capacity constraints and tiling**: The timing model doesn't check
   whether tensors fit in the 32MB on-chip SRAM. Large tensors would need
   tiling with DRAM spill, adding latency.
+- **Double-buffering / compute-memory overlap**: Real accelerators pipeline
+  DMA transfers with computation on the previous tile. We use sequential
+  READ → COMPUTE → WRITE phases.
+- **GPU-accelerator memory contention**: The accelerator uses a dedicated
+  DRAM controller — no shared L2 or bandwidth contention with GPUs.
 - **Pipeline and startup overhead**: Each operation starts immediately with
   no pipeline fill latency.
-- **Interconnect latency**: The `AccelInferenceReq` message has no
-  modeled transport delay (PCIe or Infinity Fabric).
+- **DRAM bank conflicts**: The idealmemcontroller is ideal — no row buffer
+  effects, scheduling, or contention.
 
 ## 7. Directory Structure
 

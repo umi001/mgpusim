@@ -695,6 +695,24 @@ func (r *reporter) reportAccelBusyTime() {
 				Unit:     "cycles",
 			},
 		)
+		r.dataRecorder.InsertData(
+			tableName,
+			metric{
+				Location: t.comp.Name(),
+				What:     "total_read_bytes",
+				Value:    float64(accelComp.TotalReadBytes()),
+				Unit:     "bytes",
+			},
+		)
+		r.dataRecorder.InsertData(
+			tableName,
+			metric{
+				Location: t.comp.Name(),
+				What:     "total_write_bytes",
+				Value:    float64(accelComp.TotalWriteBytes()),
+				Unit:     "bytes",
+			},
+		)
 	}
 }
 
