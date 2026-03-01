@@ -110,6 +110,7 @@ The core framework is built and compiles. A basic end-to-end proof of concept wo
 | `amd/timing/accelerator/builder.go` | Builder for accelerator component |
 | `amd/samples/runner/timingconfig/accelbuilder/builder.go` | Platform-level builder, wires accelerator to driver + DRAM |
 | `docs/approach2_design.md` | Design document with rationale for paper writing |
+| `docs/phase2_5_full_traffic_plan.md` | Full-traffic interconnect plan (optical vs electrical) |
 | `amd/benchmarks/dnn/acceltensor/operator.go` | `tensor.Operator` impl — accelerator dispatch + host fallbacks |
 | `amd/benchmarks/dnn/acceltensor/tensor.go` | Tensor struct with device pointer |
 | `amd/benchmarks/dnn/tensor/tensor.go` | `DeviceTensor` interface (extends `Tensor` with `Ptr()`) |
@@ -125,14 +126,15 @@ The core framework is built and compiles. A basic end-to-end proof of concept wo
 - Added 7 new protocol constants, 6 new timing estimate functions in `comp.go`
 - Each converted op computes functionally on CPU then dispatches AccelInferenceReq for timing
 
-#### Phase 2: Timing model accuracy — DONE ✓
-- Implemented roofline model: `latency = max(compute_cycles, memory_cycles)` where `memory_cycles = ceil(total_bytes / memBandwidthBW)`
-- Wired accelerator's `ToMem` port to `idealmemcontroller` (100-cycle DRAM latency) via `directconnection` in `accelbuilder`
-- DMA-style memory model: issues `mem.ReadReq` per input tensor, `mem.WriteReq` for output (64-byte probes for DRAM latency; bandwidth modeled analytically)
-- Phased execution state machine in `comp.go`: READ → COMPUTE → WRITE
-- Memory traffic estimation per op type (e.g., GEMM reads M×K+K×N, writes M×N; Adam reads 4 tensors, writes 3)
-- New metrics: `total_read_bytes`, `total_write_bytes` in SQLite
-- NOT yet modeled: SRAM capacity/tiling, double-buffering, DRAM bank conflicts, GPU-accel contention
+#### Phase 2/2.5: Full-traffic memory with parameterizable interconnect — DONE ✓
+- Full-traffic DMA: every 64 bytes of tensor data generates a real `mem.ReadReq`/`mem.WriteReq` through the interconnect (not analytical probes)
+- PCIe connector between accelerator and DRAM: configurable bandwidth (`--accel-interconnect-bw`) and switch latency (`--accel-interconnect-latency`)
+- Enables optical vs electrical interconnect comparison by swapping bandwidth/latency parameters
+- Progressive request issuing with backpressure: `maxOutstandingReqs` limits in-flight DMA requests
+- Phased execution state machine: READ → COMPUTE → WRITE (memory timing emergent, compute analytical)
+- Per-tensor read traffic estimation (GEMM: input M×K, weights K×N; Adam: 4 input tensors, etc.)
+- Metrics: `total_read_bytes`, `total_write_bytes`, `total_mem_reqs`, `busy_time` in SQLite
+- NOT yet modeled: SRAM capacity/tiling, double-buffering, DRAM bank conflicts, GPU-accel shared memory contention
 
 #### Phase 3: Transformer / LLM benchmark (on branch `gpt_bench_app_2`)
 - Build a new benchmark implementing a transformer model (e.g., GPT-2 scale) using the existing `tensor.Operator` / DNN layer infrastructure

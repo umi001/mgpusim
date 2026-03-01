@@ -5,8 +5,8 @@ package accelbuilder
 import (
 	"github.com/sarchlab/akita/v4/mem/idealmemcontroller"
 	"github.com/sarchlab/akita/v4/mem/mem"
+	"github.com/sarchlab/akita/v4/noc/networking/pcie"
 	"github.com/sarchlab/akita/v4/sim"
-	"github.com/sarchlab/akita/v4/sim/directconnection"
 	"github.com/sarchlab/akita/v4/simulation"
 	"github.com/sarchlab/mgpusim/v4/amd/timing/accelerator"
 )
@@ -21,8 +21,16 @@ type Builder struct {
 	peArrayRows    int
 	peArrayCols    int
 	sramSizeBytes  uint64
-	memBandwidthBW float64
 	dramSize       uint64
+
+	// Interconnect parameters (between accelerator and its DRAM).
+	// These can be changed to model different interconnect technologies
+	// (e.g., electrical vs optical).
+	interconnectBW      uint64 // bytes per second
+	interconnectLatency int    // switch latency in cycles
+
+	// DMA queue depth: how many memory requests can be in-flight.
+	maxOutstandingReqs int
 
 	memAddrOffset uint64
 }
@@ -30,12 +38,14 @@ type Builder struct {
 // MakeBuilder creates a new Builder with default parameters.
 func MakeBuilder() Builder {
 	return Builder{
-		freq:           1 * sim.GHz,
-		peArrayRows:    256,
-		peArrayCols:    256,
-		sramSizeBytes:  32 * 1024 * 1024, // 32 MB
-		memBandwidthBW: 256,              // 256 bytes/cycle
-		dramSize:       4 * mem.GB,
+		freq:                1 * sim.GHz,
+		peArrayRows:         256,
+		peArrayCols:         256,
+		sramSizeBytes:       32 * 1024 * 1024,  // 32 MB
+		dramSize:            4 * mem.GB,
+		interconnectBW:      256 * 1000 * 1000 * 1000, // 256 GB/s
+		interconnectLatency: 10,
+		maxOutstandingReqs:  64,
 	}
 }
 
@@ -70,12 +80,6 @@ func (b Builder) WithSRAMSize(sizeBytes uint64) Builder {
 	return b
 }
 
-// WithMemBandwidth sets the memory bandwidth in bytes per cycle.
-func (b Builder) WithMemBandwidth(bw float64) Builder {
-	b.memBandwidthBW = bw
-	return b
-}
-
 // WithDRAMSize sets the device memory size.
 func (b Builder) WithDRAMSize(size uint64) Builder {
 	b.dramSize = size
@@ -88,7 +92,31 @@ func (b Builder) WithMemAddrOffset(offset uint64) Builder {
 	return b
 }
 
-// Build creates the accelerator domain containing the accelerator component.
+// WithInterconnectBW sets the interconnect bandwidth in bytes/second.
+// Controls the flit-based bandwidth of the PCIe network between the
+// accelerator and its DRAM controller.
+func (b Builder) WithInterconnectBW(bw uint64) Builder {
+	b.interconnectBW = bw
+	return b
+}
+
+// WithInterconnectLatency sets the per-switch latency in cycles for the
+// interconnect between accelerator and DRAM.
+func (b Builder) WithInterconnectLatency(lat int) Builder {
+	b.interconnectLatency = lat
+	return b
+}
+
+// WithMaxOutstandingReqs sets the DMA queue depth.
+func (b Builder) WithMaxOutstandingReqs(n int) Builder {
+	b.maxOutstandingReqs = n
+	return b
+}
+
+// Build creates the accelerator domain containing the accelerator
+// component, its DRAM controller, and the interconnect between them.
+//
+//nolint:funlen
 func (b Builder) Build(name string) *sim.Domain {
 	domain := sim.NewDomain(name)
 
@@ -97,16 +125,14 @@ func (b Builder) Build(name string) *sim.Domain {
 		WithFreq(b.freq).
 		WithPEArraySize(b.peArrayRows, b.peArrayCols).
 		WithSRAMSize(b.sramSizeBytes).
-		WithMemBandwidth(b.memBandwidthBW).
+		WithMaxOutstandingReqs(b.maxOutstandingReqs).
 		Build(name + ".AccelUnit")
 
 	b.simulation.RegisterComponent(accelComp)
 
 	domain.AddPort("ToDriver", accelComp.ToDriver)
 
-	// Wire the accelerator's ToMem port to an ideal DRAM controller.
-	// This uses the same idealmemcontroller (100-cycle latency) that GPUs
-	// use, backed by the shared globalStorage for unified memory access.
+	// Create DRAM controller (shared globalStorage for unified memory).
 	accelDRAM := idealmemcontroller.MakeBuilder().
 		WithEngine(b.simulation.GetEngine()).
 		WithFreq(b.freq).
@@ -115,24 +141,41 @@ func (b Builder) Build(name string) *sim.Domain {
 		Build(name + ".DRAM")
 	b.simulation.RegisterComponent(accelDRAM)
 
-	memConn := directconnection.MakeBuilder().
+	// Create a parameterizable interconnect between the accelerator
+	// and its DRAM using the PCIe connector. This provides flit-based
+	// bandwidth limiting and configurable switch latency.
+	//
+	// For interconnect technology studies (optical vs electrical),
+	// change interconnectBW and interconnectLatency.
+	memPCIe := pcie.NewConnector().
 		WithEngine(b.simulation.GetEngine()).
-		WithFreq(b.freq).
-		Build(name + ".MemConn")
-	b.simulation.RegisterComponent(memConn)
+		WithBandwidth(b.interconnectBW).
+		WithSwitchLatency(b.interconnectLatency)
 
-	memConn.PlugIn(accelComp.ToMem)
-	memConn.PlugIn(accelDRAM.GetPortByName("Top"))
+	memPCIe.CreateNetwork(name + ".MemNet")
+
+	rootID := memPCIe.AddRootComplex(
+		[]sim.Port{accelDRAM.GetPortByName("Top")},
+	)
+
+	switchID := memPCIe.AddSwitch(rootID)
+
+	memPCIe.PlugInDevice(switchID,
+		[]sim.Port{accelComp.ToMem},
+	)
+
+	memPCIe.EstablishRoute()
 
 	// Tell the accelerator where to route memory requests.
+	// The PCIe network handles routing transparently.
 	localModules := &mem.SinglePortMapper{
 		Port: accelDRAM.GetPortByName("Top").AsRemote(),
 	}
 	accelComp.SetLocalModuleFinder(localModules)
 
-	// ToMem is now wired internally to the DRAM controller; do NOT expose
-	// it as a domain port, otherwise the PCIe connector will try to
-	// connect it a second time.
+	// ToMem is wired internally to the DRAM controller via PCIe;
+	// do NOT expose it as a domain port, otherwise the system-level
+	// PCIe connector will try to connect it a second time.
 
 	return domain
 }
