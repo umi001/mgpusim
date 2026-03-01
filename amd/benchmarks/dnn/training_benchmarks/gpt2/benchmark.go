@@ -140,8 +140,11 @@ func (b *Benchmark) createGPUInstance( //nolint:funlen
 	gpuOp := gputensor.NewGPUOperator(b.driver, ctx)
 
 	var accelOp tensor.Operator
-	if b.driver.GetNumAccelerators() > 0 && len(b.accelBlockSet) > 0 {
-		b.driver.SelectAccelerator(ctx, 0)
+
+	numAccel := b.driver.GetNumAccelerators()
+	if numAccel > 0 && len(b.accelBlockSet) > 0 {
+		accelIdx := len(b.instances) % numAccel
+		b.driver.SelectAccelerator(ctx, accelIdx)
 		accelOp = acceltensor.NewOperator(b.driver, ctx)
 	} else {
 		accelOp = gpuOp
