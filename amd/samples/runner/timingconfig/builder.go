@@ -31,6 +31,11 @@ type Builder struct {
 	useMagicMemoryCopy bool
 	gpuType            string
 
+	// Accelerator interconnect parameters.
+	accelInterconnectBW      uint64 // bytes/sec
+	accelInterconnectLatency int    // switch latency cycles
+	accelMaxOutstandingReqs  int    // DMA queue depth
+
 	platform          *sim.Domain
 	globalStorage     *mem.Storage
 	rdmaAddressMapper *mem.BankedAddressPortMapper
@@ -71,6 +76,27 @@ func (b Builder) WithMagicMemoryCopy() Builder {
 // WithNumAccelerators sets the number of inference accelerators to simulate.
 func (b Builder) WithNumAccelerators(n int) Builder {
 	b.numAccelerators = n
+	return b
+}
+
+// WithAccelInterconnectBW sets the accelerator-to-DRAM bandwidth in
+// bytes/second.
+func (b Builder) WithAccelInterconnectBW(bw uint64) Builder {
+	b.accelInterconnectBW = bw
+	return b
+}
+
+// WithAccelInterconnectLatency sets the per-switch latency in cycles
+// for the accelerator-to-DRAM interconnect.
+func (b Builder) WithAccelInterconnectLatency(lat int) Builder {
+	b.accelInterconnectLatency = lat
+	return b
+}
+
+// WithAccelMaxOutstandingReqs sets the DMA queue depth for the
+// accelerator's memory interface.
+func (b Builder) WithAccelMaxOutstandingReqs(n int) Builder {
+	b.accelMaxOutstandingReqs = n
 	return b
 }
 
@@ -326,6 +352,18 @@ func (b *Builder) createAccelerator(
 		WithSimulation(b.simulation).
 		WithGlobalStorage(b.globalStorage).
 		WithMemAddrOffset(memAddrOffset)
+
+	if b.accelInterconnectBW > 0 {
+		ab = ab.WithInterconnectBW(b.accelInterconnectBW)
+	}
+
+	if b.accelInterconnectLatency > 0 {
+		ab = ab.WithInterconnectLatency(b.accelInterconnectLatency)
+	}
+
+	if b.accelMaxOutstandingReqs > 0 {
+		ab = ab.WithMaxOutstandingReqs(b.accelMaxOutstandingReqs)
+	}
 
 	accel := ab.Build(name)
 

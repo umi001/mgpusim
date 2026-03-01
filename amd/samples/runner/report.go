@@ -713,6 +713,15 @@ func (r *reporter) reportAccelBusyTime() {
 				Unit:     "bytes",
 			},
 		)
+		r.dataRecorder.InsertData(
+			tableName,
+			metric{
+				Location: t.comp.Name(),
+				What:     "total_mem_reqs",
+				Value:    float64(accelComp.TotalMemReqs()),
+				Unit:     "count",
+			},
+		)
 	}
 }
 

@@ -12,22 +12,22 @@ type Builder struct {
 	localModules mem.AddressToPortMapper
 	bufferSize   int
 
-	peArrayRows    int
-	peArrayCols    int
-	sramSizeBytes  uint64
-	memBandwidthBW float64
+	peArrayRows        int
+	peArrayCols        int
+	sramSizeBytes      uint64
+	maxOutstandingReqs int
 }
 
 // MakeBuilder creates a new Builder with default configuration.
 // Defaults model a 256x256 systolic array at 1 GHz with 32MB SRAM.
 func MakeBuilder() Builder {
 	return Builder{
-		freq:           1 * sim.GHz,
-		bufferSize:     128,
-		peArrayRows:    256,
-		peArrayCols:    256,
-		sramSizeBytes:  32 * 1024 * 1024, // 32 MB
-		memBandwidthBW: 256,              // 256 bytes/cycle
+		freq:               1 * sim.GHz,
+		bufferSize:         512,
+		peArrayRows:        256,
+		peArrayCols:        256,
+		sramSizeBytes:      32 * 1024 * 1024, // 32 MB
+		maxOutstandingReqs: 64,
 	}
 }
 
@@ -68,9 +68,10 @@ func (b Builder) WithSRAMSize(sizeBytes uint64) Builder {
 	return b
 }
 
-// WithMemBandwidth sets the off-chip memory bandwidth in bytes per cycle.
-func (b Builder) WithMemBandwidth(bytesPerCycle float64) Builder {
-	b.memBandwidthBW = bytesPerCycle
+// WithMaxOutstandingReqs sets the DMA queue depth — how many memory
+// requests can be in-flight simultaneously.
+func (b Builder) WithMaxOutstandingReqs(n int) Builder {
+	b.maxOutstandingReqs = n
 	return b
 }
 
@@ -84,7 +85,7 @@ func (b Builder) Build(name string) *Comp {
 	accel.peArrayRows = b.peArrayRows
 	accel.peArrayCols = b.peArrayCols
 	accel.sramSizeBytes = b.sramSizeBytes
-	accel.memBandwidthBW = b.memBandwidthBW
+	accel.maxOutstandingReqs = b.maxOutstandingReqs
 	accel.localModules = b.localModules
 
 	accel.ToDriver = sim.NewPort(
@@ -94,11 +95,6 @@ func (b Builder) Build(name string) *Comp {
 
 	accel.AddPort("ToDriver", accel.ToDriver)
 	accel.AddPort("ToMem", accel.ToMem)
-
-	// TODO: Add additional ports if needed:
-	//   - CtrlPort for drain/restart (like RDMA engine)
-	//   - DMA port for large bulk transfers
-	//   - Monitoring port for performance counters
 
 	return accel
 }

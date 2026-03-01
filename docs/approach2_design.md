@@ -552,6 +552,81 @@ N = total elements from tensor dimensions.
   controller would model bank conflicts, row buffer hits/misses, and
   scheduling policies.
 
+### 5.7 Phase 2.5: Full-Traffic Memory Simulation for Interconnect Studies
+
+Phase 2.5 replaces the analytical bandwidth model with full-traffic
+simulation, enabling the study of different interconnect technologies
+(optical vs electrical) between the accelerator and its DRAM.
+
+#### Motivation
+
+The Phase 2 analytical model (`mem_cycles = total_bytes / bandwidth`)
+computed bandwidth inside the accelerator component as a constant. Changing
+the interconnect from electrical to optical would have zero effect on the
+simulation — no traffic actually flowed through the interconnect. For
+research comparing interconnect technologies, real memory requests must flow
+through a parameterizable interconnect component so that bandwidth and
+latency effects emerge naturally from the simulation.
+
+#### Architecture Change
+
+```
+BEFORE (Phase 2 — analytical):
+  AccelComp.ToMem → directconnection (0 latency) → idealmemcontroller
+  Bandwidth: hardcoded formula in comp.go
+  Traffic: 1 probe (64B) per tensor
+
+AFTER (Phase 2.5 — full traffic):
+  AccelComp.ToMem → PCIe network (configurable BW + latency) → idealmemcontroller
+  Bandwidth: emerges from PCIe flit serialization
+  Traffic: ceil(tensorBytes/64) requests per tensor
+```
+
+#### Key Design Decisions
+
+1. **PCIe connector as interconnect model**: The Akita PCIe connector
+   provides flit-based bandwidth serialization and configurable switch
+   latency. For optical vs electrical comparison:
+   - Electrical: `--accel-interconnect-bw=32000000000 --accel-interconnect-latency=140`
+   - Optical: `--accel-interconnect-bw=200000000000 --accel-interconnect-latency=10`
+
+2. **Full traffic volume**: Every 64 bytes of tensor data generates a real
+   `mem.ReadReq` or `mem.WriteReq`. A GEMM reading 100KB generates ~1,600
+   requests that flow through the interconnect, experiencing realistic
+   bandwidth contention and latency.
+
+3. **Progressive issuing with backpressure**: The accelerator limits
+   in-flight requests via `maxOutstandingReqs` (default 64). When the
+   interconnect's buffers are full, the accelerator stalls until responses
+   arrive — natural flow control.
+
+4. **Sequential phases preserved**: READ → COMPUTE → WRITE. Memory time
+   now emerges from simulation rather than being computed analytically.
+   Total operation time = read_time (emergent) + compute_time (analytical)
+   + write_time (emergent).
+
+5. **Internal PCIe network**: The accelerator-to-DRAM interconnect is a
+   separate PCIe network created inside `accelbuilder`, distinct from the
+   system-level PCIe that connects GPUs and the driver. No port conflicts.
+
+#### What Phase 2.5 Enables
+
+- **Interconnect technology comparison**: Swap bandwidth and latency
+  parameters to model electrical, optical, or any custom interconnect
+- **Bandwidth saturation analysis**: Real traffic reveals when the
+  interconnect becomes the bottleneck vs when compute dominates
+- **Contention modeling**: Multiple requests queue at PCIe endpoints,
+  revealing queuing effects absent in the analytical model
+- **Accurate per-operation timing**: Memory-bound ops naturally take longer
+  when interconnect bandwidth is lower
+
+#### Configuration
+
+CLI flags:
+- `--accel-interconnect-bw=<bytes/sec>` (default: 256 GB/s)
+- `--accel-interconnect-latency=<cycles>` (default: 10)
+- `--accel-max-outstanding=<count>` (default: 64)
+
 ## 6. What the Simulation Currently Captures
 
 ### Accurately modeled:
@@ -567,18 +642,20 @@ N = total elements from tensor dimensions.
 - **Heterogeneous scheduling**: Which layers run where, configurable at
   runtime
 
-### Modeled after Phase 2:
-- **Accelerator DRAM access latency**: The accelerator's `ToMem` port is
-  wired to an `idealmemcontroller` with 100-cycle latency, connected via
-  `directconnection`. Each operation issues `mem.ReadReq`/`mem.WriteReq`
-  for DRAM round-trip timing.
-- **Bandwidth-limited memory traffic**: Analytical calculation of total
-  read/write bytes per operation. Memory cycles = total_bytes / bandwidth.
-- **Roofline model**: `total_cycles = max(compute_cycles, mem_cycles)`.
-  Memory-bound ops (ScaleAdd, Adam, Softmax) now correctly show higher
-  cycle counts than pure compute estimates.
-- **Memory traffic metrics**: Total read bytes and write bytes reported
-  per accelerator in the SQLite metrics database.
+### Modeled after Phase 2.5:
+- **Full-traffic memory simulation**: Every 64 bytes of tensor data
+  generates a real `mem.ReadReq`/`mem.WriteReq` flowing through the
+  interconnect. Memory bandwidth and latency emerge from the simulation.
+- **Parameterizable interconnect**: The accelerator-to-DRAM link uses a
+  PCIe connector with configurable bandwidth and switch latency. Swap
+  parameters to model electrical vs optical interconnects.
+- **Bandwidth contention**: Requests queue at PCIe endpoints when bandwidth
+  is saturated. Memory-bound ops naturally take longer with lower
+  interconnect bandwidth.
+- **DMA backpressure**: The accelerator limits in-flight requests via
+  `maxOutstandingReqs`, providing natural flow control.
+- **Memory traffic metrics**: Total read bytes, write bytes, and total
+  memory transactions reported per accelerator in SQLite.
 
 ### Not yet modeled (future work):
 - **SRAM capacity constraints and tiling**: The timing model doesn't check
@@ -587,8 +664,9 @@ N = total elements from tensor dimensions.
 - **Double-buffering / compute-memory overlap**: Real accelerators pipeline
   DMA transfers with computation on the previous tile. We use sequential
   READ → COMPUTE → WRITE phases.
-- **GPU-accelerator memory contention**: The accelerator uses a dedicated
-  DRAM controller — no shared L2 or bandwidth contention with GPUs.
+- **GPU-accelerator shared memory contention**: The accelerator uses a
+  dedicated DRAM controller — no shared L2 or bandwidth contention with
+  GPUs. (Shared DRAM is a future knob for studying memory architecture.)
 - **Pipeline and startup overhead**: Each operation starts immediately with
   no pipeline fill latency.
 - **DRAM bank conflicts**: The idealmemcontroller is ideal — no row buffer

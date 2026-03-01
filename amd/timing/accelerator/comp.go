@@ -2,19 +2,15 @@
 // fixed-function inference accelerator (e.g., systolic-array / TPU-like).
 // It plugs into the Akita simulation engine alongside GPU compute units.
 //
-// The timing model uses a roofline approach:
-//
-//	latency = max(compute_cycles, memory_cycles) + DRAM_latency
-//
-// where compute_cycles comes from analytical per-op estimates and
-// memory_cycles = total_bytes / memBandwidthBW. Memory access is modeled
-// via DMA-style bulk transfers: one mem.ReadReq per input tensor for DRAM
-// latency, with bandwidth modeled analytically.
+// The timing model uses full-traffic memory simulation:
+//   - Every 64 bytes of tensor data generates a real mem.ReadReq/WriteReq
+//   - Memory bandwidth emerges from the interconnect (PCIe flit serialization)
+//   - Compute cycles are estimated analytically (PE array model)
+//   - Total time = read_time + compute_time + write_time (sequential phases)
 package accelerator
 
 import (
 	"log"
-	"math"
 	"reflect"
 
 	"github.com/sarchlab/akita/v4/mem/mem"
@@ -23,29 +19,61 @@ import (
 	"github.com/sarchlab/mgpusim/v4/amd/protocol"
 )
 
+// memReqSize is the granularity of DMA memory requests (cache line size).
+const memReqSize = 64
+
 // Execution phases for the accelerator state machine.
 // Each operation goes through: READ → COMPUTE → WRITE → done.
 const (
-	phaseReading = iota // Waiting for DRAM read responses
-	phaseCompute        // Counting down compute/roofline cycles
-	phaseWriting        // Waiting for DRAM write responses
+	phaseReading = iota // Issuing reads and waiting for responses
+	phaseCompute        // Counting down analytical compute cycles
+	phaseWriting        // Issuing writes and waiting for responses
 )
+
+// tensorTransfer tracks progressive DMA transfer of a single tensor.
+type tensorTransfer struct {
+	baseAddr          uint64
+	totalBytes        uint64
+	bytesSent         uint64 // bytes for which requests have been issued
+	responsesExpected int
+	responsesReceived int
+}
+
+// allIssued returns true if all requests for this tensor have been sent.
+func (t *tensorTransfer) allIssued() bool {
+	return t.bytesSent >= t.totalBytes
+}
+
+// allDone returns true if all responses for this tensor have been received.
+func (t *tensorTransfer) allDone() bool {
+	return t.allIssued() && t.responsesReceived >= t.responsesExpected
+}
 
 // transaction tracks one in-flight accelerator operation.
 type transaction struct {
-	req            *protocol.AccelInferenceReq
-	phase          int // phaseReading → phaseCompute → phaseWriting
-	remainCycles   int // roofline cycles: max(compute, memory bandwidth)
-	memReqsPending int // outstanding DRAM read/write requests
+	req           *protocol.AccelInferenceReq
+	phase         int // phaseReading → phaseCompute → phaseWriting
+	computeCycles int // analytical compute time (PE array)
 
+	// Read tracking: one entry per input tensor.
+	readTensors    []tensorTransfer
+	currentReadIdx int
+
+	// Write tracking: single output tensor.
+	writeTransfer tensorTransfer
+
+	// Flow control: limits in-flight memory requests.
+	outstandingReqs int
+	maxOutstanding  int
+
+	// Metrics for this operation.
 	totalReadBytes  uint64
 	totalWriteBytes uint64
 }
 
 // Comp is the top-level accelerator component.
-// It receives AccelInferenceReq from the driver, models execution latency
-// using a roofline model (max of compute and memory bandwidth), issues
-// actual memory transactions through ToMem for DRAM latency modeling,
+// It receives AccelInferenceReq from the driver, issues full-volume
+// memory traffic through ToMem, models compute cycles analytically,
 // and sends AccelInferenceRsp when done.
 type Comp struct {
 	*sim.TickingComponent
@@ -53,14 +81,15 @@ type Comp struct {
 	// ToDriver receives AccelInferenceReq and sends AccelInferenceRsp.
 	ToDriver sim.Port
 
-	// ToMem issues memory read/write requests to the DRAM controller.
+	// ToMem issues memory read/write requests through the interconnect
+	// to the DRAM controller. Full traffic volume flows through this port.
 	ToMem sim.Port
 
 	// Hardware configuration — set via Builder.
-	peArrayRows    int     // systolic array rows (e.g., 256)
-	peArrayCols    int     // systolic array cols (e.g., 256)
-	sramSizeBytes  uint64  // on-chip SRAM buffer size
-	memBandwidthBW float64 // bytes per cycle to off-chip memory
+	peArrayRows       int    // systolic array rows (e.g., 256)
+	peArrayCols       int    // systolic array cols (e.g., 256)
+	sramSizeBytes     uint64 // on-chip SRAM buffer size
+	maxOutstandingReqs int   // DMA queue depth
 
 	// Internal state
 	pendingReqs  []*protocol.AccelInferenceReq
@@ -69,9 +98,10 @@ type Comp struct {
 
 	// Metrics
 	totalOps        int
-	totalCycles     int
+	totalCycles     int // compute cycles only (memory is emergent)
 	totalReadBytes  uint64
 	totalWriteBytes uint64
+	totalMemReqs    int // actual memory transactions generated
 }
 
 // SetLocalModuleFinder sets the address-to-port mapper for memory access.
@@ -113,82 +143,197 @@ func (c *Comp) acceptNewReq() bool {
 	}
 }
 
-// startOperation initializes a new transaction with roofline timing and
-// issues DMA read requests for input tensors.
+// startOperation initializes a new transaction with full-traffic DMA
+// and begins issuing read requests for input tensors.
 //
 //nolint:funlen
 func (c *Comp) startOperation(req *protocol.AccelInferenceReq) {
 	computeCycles := c.estimateComputeCycles(req)
-	readBytes, writeBytes := c.estimateMemoryTraffic(req)
+	readTensors := c.buildReadTensors(req)
+	_, writeBytes := c.estimateMemoryTraffic(req)
 
-	totalBytes := readBytes + writeBytes
-	memCycles := int(math.Ceil(
-		float64(totalBytes) / c.memBandwidthBW))
-
-	// Roofline: total time is dominated by the slower of compute or memory.
-	rooflineCycles := computeCycles
-	if memCycles > rooflineCycles {
-		rooflineCycles = memCycles
-	}
-
-	if rooflineCycles < 1 {
-		rooflineCycles = 1
+	var totalReadBytes uint64
+	for i := range readTensors {
+		totalReadBytes += readTensors[i].totalBytes
 	}
 
 	c.totalOps++
-	c.totalCycles += rooflineCycles
+	c.totalCycles += computeCycles
 
 	c.currentTxn = &transaction{
-		req:             req,
-		remainCycles:    rooflineCycles,
-		totalReadBytes:  readBytes,
+		req:           req,
+		computeCycles: computeCycles,
+		readTensors:   readTensors,
+		writeTransfer: tensorTransfer{
+			baseAddr:   req.OutputAddr,
+			totalBytes: writeBytes,
+		},
+		maxOutstanding:  c.maxOutstandingReqs,
+		totalReadBytes:  totalReadBytes,
 		totalWriteBytes: writeBytes,
 	}
 
 	tracing.TraceReqReceive(req, c)
 
-	// Accumulate memory traffic metrics.
-	c.totalReadBytes += readBytes
+	c.totalReadBytes += totalReadBytes
 	c.totalWriteBytes += writeBytes
 
-	// Issue DMA read requests for input tensors through the DRAM hierarchy.
-	// We issue one 64-byte "probe" ReadReq per non-zero input address.
-	// The actual bandwidth is modeled analytically in rooflineCycles;
-	// these requests model the DRAM round-trip latency (100 cycles).
-	readsIssued := 0
-	if req.InputAddr != 0 && c.localModules != nil {
-		if c.issueReadReq(req.InputAddr) {
-			readsIssued++
-		}
-	}
-
-	if req.WeightsAddr != 0 && c.localModules != nil {
-		if c.issueReadReq(req.WeightsAddr) {
-			readsIssued++
-		}
-	}
-
-	if req.BiasAddr != 0 && c.localModules != nil {
-		if c.issueReadReq(req.BiasAddr) {
-			readsIssued++
-		}
-	}
-
-	if readsIssued > 0 {
+	if len(readTensors) > 0 && totalReadBytes > 0 {
 		c.currentTxn.phase = phaseReading
 	} else {
 		c.currentTxn.phase = phaseCompute
+		c.currentTxn.computeCycles = computeCycles
 	}
 }
 
-// issueReadReq sends a 64-byte read request to the DRAM controller
-// for DMA latency modeling. Returns true if the request was sent.
-func (c *Comp) issueReadReq(addr uint64) bool {
+// buildReadTensors creates per-tensor transfer descriptors for all
+// input tensors that need to be read from DRAM.
+//
+//nolint:gocognit,funlen
+func (c *Comp) buildReadTensors(
+	req *protocol.AccelInferenceReq,
+) []tensorTransfer {
+	const bpf = 4 // bytes per float32
+	var transfers []tensorTransfer
+
+	switch req.OpType {
+	case protocol.AccelOpGEMM, protocol.AccelOpMatMul:
+		m := uint64(req.Params.M)
+		k := uint64(req.Params.K)
+		n := uint64(req.Params.N)
+		if req.InputAddr != 0 {
+			transfers = append(transfers, tensorTransfer{
+				baseAddr: req.InputAddr, totalBytes: m * k * bpf,
+			})
+		}
+		if req.WeightsAddr != 0 {
+			transfers = append(transfers, tensorTransfer{
+				baseAddr: req.WeightsAddr, totalBytes: k * n * bpf,
+			})
+		}
+		if req.BiasAddr != 0 {
+			transfers = append(transfers, tensorTransfer{
+				baseAddr: req.BiasAddr, totalBytes: n * bpf,
+			})
+		}
+
+	case protocol.AccelOpConv2D:
+		nIn := uint64(inputElements(req))
+		inC := uint64(req.Params.InChannels)
+		outC := uint64(req.Params.OutChannels)
+		kH := uint64(req.Params.KernelSize[0])
+		kW := uint64(req.Params.KernelSize[1])
+		if req.InputAddr != 0 {
+			transfers = append(transfers, tensorTransfer{
+				baseAddr: req.InputAddr, totalBytes: nIn * bpf,
+			})
+		}
+		if req.WeightsAddr != 0 {
+			transfers = append(transfers, tensorTransfer{
+				baseAddr:   req.WeightsAddr,
+				totalBytes: outC * inC * kH * kW * bpf,
+			})
+		}
+
+	case protocol.AccelOpScaleAdd:
+		nIn := uint64(inputElements(req))
+		if req.InputAddr != 0 {
+			transfers = append(transfers, tensorTransfer{
+				baseAddr: req.InputAddr, totalBytes: nIn * bpf,
+			})
+		}
+		if req.WeightsAddr != 0 {
+			transfers = append(transfers, tensorTransfer{
+				baseAddr: req.WeightsAddr, totalBytes: nIn * bpf,
+			})
+		}
+
+	case protocol.AccelOpAdam:
+		nIn := uint64(inputElements(req))
+		// params + gradients + vHistory + sHistory
+		if req.InputAddr != 0 {
+			transfers = append(transfers, tensorTransfer{
+				baseAddr: req.InputAddr, totalBytes: nIn * bpf,
+			})
+		}
+		if req.WeightsAddr != 0 {
+			transfers = append(transfers, tensorTransfer{
+				baseAddr: req.WeightsAddr, totalBytes: nIn * bpf,
+			})
+		}
+		if req.BiasAddr != 0 {
+			transfers = append(transfers, tensorTransfer{
+				baseAddr: req.BiasAddr, totalBytes: nIn * bpf,
+			})
+		}
+		if req.OutputAddr != 0 {
+			// sHistory read as 4th input (reuse OutputAddr)
+			transfers = append(transfers, tensorTransfer{
+				baseAddr: req.OutputAddr, totalBytes: nIn * bpf,
+			})
+		}
+
+	case protocol.AccelOpRMSProp:
+		nIn := uint64(inputElements(req))
+		// params + gradients + sHistory
+		if req.InputAddr != 0 {
+			transfers = append(transfers, tensorTransfer{
+				baseAddr: req.InputAddr, totalBytes: nIn * bpf,
+			})
+		}
+		if req.WeightsAddr != 0 {
+			transfers = append(transfers, tensorTransfer{
+				baseAddr: req.WeightsAddr, totalBytes: nIn * bpf,
+			})
+		}
+		if req.BiasAddr != 0 {
+			transfers = append(transfers, tensorTransfer{
+				baseAddr: req.BiasAddr, totalBytes: nIn * bpf,
+			})
+		}
+
+	case protocol.AccelOpCrossEntropy,
+		protocol.AccelOpCrossEntropyDeriv,
+		protocol.AccelOpSoftmaxCrossEntropyDeriv:
+		nIn := uint64(inputElements(req))
+		// predictions + labels
+		if req.InputAddr != 0 {
+			transfers = append(transfers, tensorTransfer{
+				baseAddr: req.InputAddr, totalBytes: nIn * bpf,
+			})
+		}
+		if req.WeightsAddr != 0 {
+			transfers = append(transfers, tensorTransfer{
+				baseAddr: req.WeightsAddr, totalBytes: nIn * bpf,
+			})
+		}
+
+	default:
+		// ReLU, ElementWise, Softmax, Reduction, Pooling:
+		// single input tensor
+		nIn := uint64(inputElements(req))
+		if req.InputAddr != 0 {
+			transfers = append(transfers, tensorTransfer{
+				baseAddr: req.InputAddr, totalBytes: nIn * bpf,
+			})
+		}
+	}
+
+	return transfers
+}
+
+// issueReadReq sends a 64-byte read request through the interconnect
+// to the DRAM controller. Returns true if the request was sent.
+func (c *Comp) issueReadReq(addr uint64, size uint64) bool {
+	if c.localModules == nil {
+		return false
+	}
+
 	readReq := mem.ReadReqBuilder{}.
 		WithSrc(c.ToMem.AsRemote()).
 		WithDst(c.localModules.Find(addr)).
 		WithAddress(addr).
-		WithByteSize(64).
+		WithByteSize(size).
 		Build()
 
 	err := c.ToMem.Send(readReq)
@@ -196,19 +341,23 @@ func (c *Comp) issueReadReq(addr uint64) bool {
 		return false
 	}
 
-	c.currentTxn.memReqsPending++
+	c.totalMemReqs++
 
 	return true
 }
 
-// issueWriteReq sends a 64-byte write request to the DRAM controller
-// for DMA latency modeling. Returns true if the request was sent.
-func (c *Comp) issueWriteReq(addr uint64) bool {
+// issueWriteReq sends a 64-byte write request through the interconnect
+// to the DRAM controller. Returns true if the request was sent.
+func (c *Comp) issueWriteReq(addr uint64, size uint64) bool {
+	if c.localModules == nil {
+		return false
+	}
+
 	writeReq := mem.WriteReqBuilder{}.
 		WithSrc(c.ToMem.AsRemote()).
 		WithDst(c.localModules.Find(addr)).
 		WithAddress(addr).
-		WithData(make([]byte, 64)).
+		WithData(make([]byte, size)).
 		Build()
 
 	err := c.ToMem.Send(writeReq)
@@ -216,7 +365,7 @@ func (c *Comp) issueWriteReq(addr uint64) bool {
 		return false
 	}
 
-	c.currentTxn.memReqsPending++
+	c.totalMemReqs++
 
 	return true
 }
@@ -240,59 +389,127 @@ func (c *Comp) processCurrentOp() bool {
 	}
 }
 
-// processReadPhase waits for all DRAM read responses before starting compute.
+// processReadPhase progressively issues 64-byte read requests for all
+// input tensors, respecting the maxOutstanding limit for backpressure.
 func (c *Comp) processReadPhase() bool {
-	if c.currentTxn.memReqsPending > 0 {
+	txn := c.currentTxn
+	madeProgress := false
+
+	// Issue read requests up to maxOutstanding limit.
+	for txn.outstandingReqs < txn.maxOutstanding {
+		if txn.currentReadIdx >= len(txn.readTensors) {
+			break // all tensors fully issued
+		}
+
+		rt := &txn.readTensors[txn.currentReadIdx]
+		if rt.allIssued() {
+			txn.currentReadIdx++
+			continue
+		}
+
+		addr := rt.baseAddr + rt.bytesSent
+		remaining := rt.totalBytes - rt.bytesSent
+		reqSize := uint64(memReqSize)
+		if remaining < reqSize {
+			reqSize = remaining
+		}
+
+		if c.issueReadReq(addr, reqSize) {
+			rt.bytesSent += reqSize
+			rt.responsesExpected++
+			txn.outstandingReqs++
+			madeProgress = true
+		} else {
+			break // port backpressure
+		}
+	}
+
+	// Check if all reads are complete.
+	if c.allReadsComplete() {
+		txn.phase = phaseCompute
+		madeProgress = true
+	}
+
+	return madeProgress
+}
+
+// allReadsComplete returns true when all tensor reads have been issued
+// and all responses received.
+func (c *Comp) allReadsComplete() bool {
+	txn := c.currentTxn
+	if txn.currentReadIdx < len(txn.readTensors) {
 		return false
 	}
 
-	// All reads complete — transition to compute phase.
-	c.currentTxn.phase = phaseCompute
+	for i := range txn.readTensors {
+		if !txn.readTensors[i].allDone() {
+			return false
+		}
+	}
 
 	return true
 }
 
-// processComputePhase counts down the roofline cycles.
+// processComputePhase counts down the analytical compute cycles.
 func (c *Comp) processComputePhase() bool {
-	c.currentTxn.remainCycles--
+	c.currentTxn.computeCycles--
 
-	if c.currentTxn.remainCycles <= 0 {
-		// Compute done — issue write for output tensor.
+	if c.currentTxn.computeCycles <= 0 {
 		return c.transitionToWritePhase()
 	}
 
 	return true
 }
 
-// transitionToWritePhase issues a DMA write for the output tensor
-// and transitions to the write phase.
+// transitionToWritePhase moves to the write phase. If there's no output
+// to write, completes the operation immediately.
 func (c *Comp) transitionToWritePhase() bool {
-	req := c.currentTxn.req
-
-	if req.OutputAddr != 0 && c.localModules != nil {
-		if c.issueWriteReq(req.OutputAddr) {
-			c.currentTxn.phase = phaseWriting
-			return true
-		}
-
-		// Port full — retry next cycle. Keep remainCycles at 0 so
-		// we'll retry the transition on next tick.
-		c.currentTxn.remainCycles = 0
-
-		return false
+	wt := &c.currentTxn.writeTransfer
+	if wt.baseAddr == 0 || wt.totalBytes == 0 {
+		return c.completeOperation()
 	}
 
-	// No output to write — complete immediately.
-	return c.completeOperation()
+	c.currentTxn.phase = phaseWriting
+
+	return true
 }
 
-// processWritePhase waits for DRAM write response before completing.
+// processWritePhase progressively issues 64-byte write requests for the
+// output tensor, respecting the maxOutstanding limit.
 func (c *Comp) processWritePhase() bool {
-	if c.currentTxn.memReqsPending > 0 {
-		return false
+	txn := c.currentTxn
+	wt := &txn.writeTransfer
+	madeProgress := false
+
+	// Issue write requests up to maxOutstanding limit.
+	for txn.outstandingReqs < txn.maxOutstanding {
+		if wt.allIssued() {
+			break
+		}
+
+		addr := wt.baseAddr + wt.bytesSent
+		remaining := wt.totalBytes - wt.bytesSent
+		reqSize := uint64(memReqSize)
+		if remaining < reqSize {
+			reqSize = remaining
+		}
+
+		if c.issueWriteReq(addr, reqSize) {
+			wt.bytesSent += reqSize
+			wt.responsesExpected++
+			txn.outstandingReqs++
+			madeProgress = true
+		} else {
+			break // port backpressure
+		}
 	}
 
-	return c.completeOperation()
+	// Check if all writes are complete.
+	if wt.allDone() {
+		return c.completeOperation()
+	}
+
+	return madeProgress
 }
 
 // completeOperation sends the response back to the driver and clears
@@ -318,27 +535,53 @@ func (c *Comp) completeOperation() bool {
 	return true
 }
 
-// processMemRsp handles memory read/write responses from the DRAM controller.
+// processMemRsp handles memory read/write responses from the DRAM
+// controller. Drains all available responses per tick.
 func (c *Comp) processMemRsp() bool {
-	msg := c.ToMem.PeekIncoming()
-	if msg == nil {
-		return false
+	madeProgress := false
+
+	for {
+		msg := c.ToMem.PeekIncoming()
+		if msg == nil {
+			break
+		}
+
+		c.ToMem.RetrieveIncoming()
+		madeProgress = true
+
+		if c.currentTxn == nil {
+			continue
+		}
+
+		c.currentTxn.outstandingReqs--
+
+		switch c.currentTxn.phase {
+		case phaseReading:
+			c.creditReadResponse()
+		case phaseWriting:
+			c.currentTxn.writeTransfer.responsesReceived++
+		}
 	}
 
-	c.ToMem.RetrieveIncoming()
-
-	if c.currentTxn != nil {
-		c.currentTxn.memReqsPending--
-	}
-
-	return true
+	return madeProgress
 }
 
-// --- Roofline timing model: compute cycle estimates ---
+// creditReadResponse assigns a response to the first read tensor that
+// still has outstanding responses.
+func (c *Comp) creditReadResponse() {
+	for i := range c.currentTxn.readTensors {
+		rt := &c.currentTxn.readTensors[i]
+		if rt.responsesReceived < rt.responsesExpected {
+			rt.responsesReceived++
+			return
+		}
+	}
+}
+
+// --- Compute cycle estimates (analytical PE array model) ---
 
 // estimateComputeCycles returns the compute-bound cycle count for an
-// operation. The roofline model takes max(compute, memory) — this function
-// provides the compute component.
+// operation, based on the PE array dimensions.
 func (c *Comp) estimateComputeCycles(
 	req *protocol.AccelInferenceReq,
 ) int {
@@ -393,7 +636,6 @@ func (c *Comp) estimateGEMMComputeCycles(
 	n := int(req.Params.N)
 	k := int(req.Params.K)
 
-	// total_MACs / (array_rows * array_cols)
 	totalMACs := m * n * k
 	cycles := totalMACs / (c.peArrayRows * c.peArrayCols)
 
@@ -407,8 +649,6 @@ func (c *Comp) estimateGEMMComputeCycles(
 func (c *Comp) estimateConv2DComputeCycles(
 	req *protocol.AccelInferenceReq,
 ) int {
-	// Conv2D lowered to GEMM: M=OutChannels, N=batch*outH*outW,
-	// K=InChannels*kH*kW.
 	outChannels := int(req.Params.OutChannels)
 	inChannels := int(req.Params.InChannels)
 	kH := int(req.Params.KernelSize[0])
@@ -434,7 +674,6 @@ func (c *Comp) estimateConv2DComputeCycles(
 func (c *Comp) estimatePoolingComputeCycles(
 	req *protocol.AccelInferenceReq,
 ) int {
-	// Pooling is memory-bound with trivial compute.
 	total := inputElements(req)
 	cycles := total / c.peArrayCols
 
@@ -458,8 +697,6 @@ func (c *Comp) estimateElementWiseComputeCycles(
 	return cycles
 }
 
-// Softmax: 3 passes (exp, sum, div). Compute per element is trivial;
-// each pass pipelines through vector lanes.
 func (c *Comp) estimateSoftmaxComputeCycles(
 	req *protocol.AccelInferenceReq,
 ) int {
@@ -473,7 +710,6 @@ func (c *Comp) estimateSoftmaxComputeCycles(
 	return cycles
 }
 
-// ScaleAdd: alpha*A + beta*B. One multiply-add per element, trivial.
 func (c *Comp) estimateScaleAddComputeCycles(
 	req *protocol.AccelInferenceReq,
 ) int {
@@ -487,7 +723,6 @@ func (c *Comp) estimateScaleAddComputeCycles(
 	return cycles
 }
 
-// Reduction: single pass read + log-tree reduction (dominated by read).
 func (c *Comp) estimateReductionComputeCycles(
 	req *protocol.AccelInferenceReq,
 ) int {
@@ -501,7 +736,6 @@ func (c *Comp) estimateReductionComputeCycles(
 	return cycles
 }
 
-// Adam: trivial per-element arithmetic (a few multiply-adds).
 func (c *Comp) estimateAdamComputeCycles(
 	req *protocol.AccelInferenceReq,
 ) int {
@@ -515,7 +749,6 @@ func (c *Comp) estimateAdamComputeCycles(
 	return cycles
 }
 
-// RMSProp: trivial per-element arithmetic.
 func (c *Comp) estimateRMSPropComputeCycles(
 	req *protocol.AccelInferenceReq,
 ) int {
@@ -529,7 +762,6 @@ func (c *Comp) estimateRMSPropComputeCycles(
 	return cycles
 }
 
-// CrossEntropy: trivial per-element arithmetic.
 func (c *Comp) estimateCrossEntropyComputeCycles(
 	req *protocol.AccelInferenceReq,
 ) int {
@@ -543,12 +775,11 @@ func (c *Comp) estimateCrossEntropyComputeCycles(
 	return cycles
 }
 
-// --- Roofline timing model: memory traffic estimates ---
+// --- Memory traffic estimates (used for metrics only) ---
 
 // estimateMemoryTraffic returns (readBytes, writeBytes) for the operation.
-// These are used for the bandwidth component of the roofline model:
-//
-//	mem_cycles = (readBytes + writeBytes) / memBandwidthBW
+// Used for reporting metrics. The actual traffic is driven by
+// buildReadTensors() and the write transfer.
 //
 //nolint:gocognit,funlen
 func (c *Comp) estimateMemoryTraffic(
@@ -564,7 +795,6 @@ func (c *Comp) estimateMemoryTraffic(
 		m := uint64(req.Params.M)
 		n := uint64(req.Params.N)
 		k := uint64(req.Params.K)
-		// Read A[M×K] + B[K×N], write C[M×N]
 		readBytes = (m*k + k*n) * bytesPerFloat32
 		writeBytes = m * n * bytesPerFloat32
 
@@ -573,60 +803,47 @@ func (c *Comp) estimateMemoryTraffic(
 		outC := uint64(req.Params.OutChannels)
 		kH := uint64(req.Params.KernelSize[0])
 		kW := uint64(req.Params.KernelSize[1])
-		// Read input + filter, write output
 		readBytes = (nIn + outC*inC*kH*kW) * bytesPerFloat32
 		writeBytes = nOut * bytesPerFloat32
 
 	case protocol.AccelOpReLU, protocol.AccelOpElementWise:
-		// Read 1 input, write 1 output (same size)
 		readBytes = nIn * bytesPerFloat32
 		writeBytes = nIn * bytesPerFloat32
 
 	case protocol.AccelOpScaleAdd:
-		// Read 2 inputs, write 1 output
 		readBytes = 2 * nIn * bytesPerFloat32
 		writeBytes = nIn * bytesPerFloat32
 
 	case protocol.AccelOpSoftmax:
-		// Read input, write output (same size)
 		readBytes = nIn * bytesPerFloat32
 		writeBytes = nIn * bytesPerFloat32
 
 	case protocol.AccelOpReduction:
-		// Read all input, write scalar output
 		readBytes = nIn * bytesPerFloat32
 		writeBytes = bytesPerFloat32
 
 	case protocol.AccelOpAdam:
-		// Read params + gradients + vHistory + sHistory (4 tensors)
-		// Write params + vHistory + sHistory (3 tensors)
 		readBytes = 4 * nIn * bytesPerFloat32
 		writeBytes = 3 * nIn * bytesPerFloat32
 
 	case protocol.AccelOpRMSProp:
-		// Read params + gradients + sHistory (3 tensors)
-		// Write params + sHistory (2 tensors)
 		readBytes = 3 * nIn * bytesPerFloat32
 		writeBytes = 2 * nIn * bytesPerFloat32
 
 	case protocol.AccelOpCrossEntropy:
-		// Read predictions + labels, write scalar loss
 		readBytes = 2 * nIn * bytesPerFloat32
 		writeBytes = bytesPerFloat32
 
 	case protocol.AccelOpCrossEntropyDeriv,
 		protocol.AccelOpSoftmaxCrossEntropyDeriv:
-		// Read predictions + labels, write gradient tensor
 		readBytes = 2 * nIn * bytesPerFloat32
 		writeBytes = nIn * bytesPerFloat32
 
 	case protocol.AccelOpMaxPool, protocol.AccelOpAvgPool:
-		// Read input, write (smaller) output
 		readBytes = nIn * bytesPerFloat32
 		writeBytes = nOut * bytesPerFloat32
 
 	default:
-		// Conservative fallback: assume 1 read + 1 write
 		readBytes = nIn * bytesPerFloat32
 		writeBytes = nIn * bytesPerFloat32
 	}
@@ -641,7 +858,8 @@ func (c *Comp) TotalOps() int {
 	return c.totalOps
 }
 
-// TotalCycles returns the total roofline cycles (max of compute, memory).
+// TotalCycles returns the total compute cycles (PE array model).
+// Memory latency is emergent from the interconnect simulation.
 func (c *Comp) TotalCycles() int {
 	return c.totalCycles
 }
@@ -654,6 +872,11 @@ func (c *Comp) TotalReadBytes() uint64 {
 // TotalWriteBytes returns the total bytes written to DRAM across all ops.
 func (c *Comp) TotalWriteBytes() uint64 {
 	return c.totalWriteBytes
+}
+
+// TotalMemReqs returns the total number of memory transactions generated.
+func (c *Comp) TotalMemReqs() int {
+	return c.totalMemReqs
 }
 
 // SetFreq sets the operating frequency of the accelerator.
