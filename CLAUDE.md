@@ -92,9 +92,8 @@ The core framework is built and compiles. A basic end-to-end proof of concept wo
 
 **Accelerator operator (`acceltensor/operator.go`):**
 - Memory operations fully implemented: `Create`, `Free`, `Copy`, `Clone`, `Init`, `Slice`, `Repeat`, `Clear`, `Zeros`, `Reshape`
-- `Gemm`: dispatches to accelerator hardware via `AccelInferenceReq` (timing-accurate)
-- Host fallback (functionally correct but NO timing model): `Softmax`, `CrossEntropy`, `CrossEntropyDerivative`, `SoftmaxCrossEntropyDerivative`, `ElementWiseMul`, `ScaleAdd`, `RMSProp`, `Adam`, `ReluForward`, `ReluBackward`, `Sum`
-- Not implemented (panic): `Im2Col`, `Transpose`, `Rotate180`, `Dilate`, `MaxPoolingForward/Backward`, `AvgPoolingForward/Backward`
+- Timing-accurate (dispatch `AccelInferenceReq`): `Gemm`, `Softmax`, `CrossEntropy`, `CrossEntropyDerivative`, `SoftmaxCrossEntropyDerivative`, `ElementWiseMul`, `ScaleAdd`, `RMSProp`, `Adam`, `ReluForward`, `ReluBackward`, `Sum`
+- CPU fallback (no timing): `Im2Col`, `Transpose`, `Rotate180`, `Dilate`, `MaxPoolingForward/Backward`, `AvgPoolingForward/Backward`
 
 ### Design
 
@@ -109,7 +108,8 @@ The core framework is built and compiles. A basic end-to-end proof of concept wo
 | `amd/protocol/accelprotocol.go` | `AccelInferenceReq/Rsp` messages, op type constants |
 | `amd/timing/accelerator/comp.go` | Accelerator Akita component with `Tick()`, timing model, metrics |
 | `amd/timing/accelerator/builder.go` | Builder for accelerator component |
-| `amd/samples/runner/timingconfig/accelbuilder/builder.go` | Platform-level builder, wires accelerator to driver |
+| `amd/samples/runner/timingconfig/accelbuilder/builder.go` | Platform-level builder, wires accelerator to driver + DRAM |
+| `docs/approach2_design.md` | Design document with rationale for paper writing |
 | `amd/benchmarks/dnn/acceltensor/operator.go` | `tensor.Operator` impl — accelerator dispatch + host fallbacks |
 | `amd/benchmarks/dnn/acceltensor/tensor.go` | Tensor struct with device pointer |
 | `amd/benchmarks/dnn/tensor/tensor.go` | `DeviceTensor` interface (extends `Tensor` with `Ptr()`) |
@@ -117,21 +117,24 @@ The core framework is built and compiles. A basic end-to-end proof of concept wo
 | `amd/driver/driver.go` | `RegisterAccelerator()`, accelerator command processing |
 | `amd/samples/runner/report.go` | Accelerator metric collection and reporting |
 
-### Remaining Work — Path to LLM Workload
+### Phases — Path to LLM Workload
 
-#### Phase 1: Complete acceltensor operations
-- Convert host-fallback ops to accelerator dispatch (send `AccelInferenceReq` with proper op type): `ReluForward`, `ReluBackward`, `Softmax`, `ElementWiseMul`, `ScaleAdd`, `Adam`, etc.
-- Implement missing ops needed for Conv2D layers: `Im2Col`, `Transpose`, `Rotate180`, `Dilate`, pooling ops
-- Each converted op needs a corresponding timing estimate in `comp.go`
+#### Phase 1: Complete acceltensor operations — DONE ✓
+- Converted 11 host-fallback ops to accelerator dispatch (send `AccelInferenceReq` with proper op type): `ReluForward`, `ReluBackward`, `Softmax`, `ElementWiseMul`, `ScaleAdd`, `Adam`, `RMSProp`, `Sum`, `CrossEntropy`, `CrossEntropyDerivative`, `SoftmaxCrossEntropyDerivative`
+- Implemented 8 missing ops as CPU fallback: `Im2Col`, `Transpose`, `Rotate180`, `Dilate`, pooling ops
+- Added 7 new protocol constants, 6 new timing estimate functions in `comp.go`
+- Each converted op computes functionally on CPU then dispatches AccelInferenceReq for timing
 
-#### Phase 2: Timing model accuracy
-- Current timing model is a simplified MAC-count / PE-array-size formula with no memory modeling
-- Implement roofline model: `latency = max(compute_cycles, memory_cycles)` where `memory_cycles = bytes_transferred / memBandwidthBW`
-- Model tiling over the systolic array for large GEMMs
-- Wire accelerator's `ToMem` port to DRAM/L2 in `accelbuilder` for actual memory transaction simulation (currently disconnected — "magic memory")
-- Add pipeline overhead and startup latency
+#### Phase 2: Timing model accuracy — DONE ✓
+- Implemented roofline model: `latency = max(compute_cycles, memory_cycles)` where `memory_cycles = ceil(total_bytes / memBandwidthBW)`
+- Wired accelerator's `ToMem` port to `idealmemcontroller` (100-cycle DRAM latency) via `directconnection` in `accelbuilder`
+- DMA-style memory model: issues `mem.ReadReq` per input tensor, `mem.WriteReq` for output (64-byte probes for DRAM latency; bandwidth modeled analytically)
+- Phased execution state machine in `comp.go`: READ → COMPUTE → WRITE
+- Memory traffic estimation per op type (e.g., GEMM reads M×K+K×N, writes M×N; Adam reads 4 tensors, writes 3)
+- New metrics: `total_read_bytes`, `total_write_bytes` in SQLite
+- NOT yet modeled: SRAM capacity/tiling, double-buffering, DRAM bank conflicts, GPU-accel contention
 
-#### Phase 3: Transformer / LLM benchmark
+#### Phase 3: Transformer / LLM benchmark (on branch `gpt_bench_app_2`)
 - Build a new benchmark implementing a transformer model (e.g., GPT-2 scale) using the existing `tensor.Operator` / DNN layer infrastructure
 - Required new layer types: multi-head self-attention, layer normalization, GELU/SiLU activation, embedding lookup
 - Required new ops in both gputensor and acceltensor: `LayerNorm`, `Attention` (Q*K^T, softmax, *V), `GELU`

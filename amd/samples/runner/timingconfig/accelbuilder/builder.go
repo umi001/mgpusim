@@ -3,8 +3,10 @@
 package accelbuilder
 
 import (
+	"github.com/sarchlab/akita/v4/mem/idealmemcontroller"
 	"github.com/sarchlab/akita/v4/mem/mem"
 	"github.com/sarchlab/akita/v4/sim"
+	"github.com/sarchlab/akita/v4/sim/directconnection"
 	"github.com/sarchlab/akita/v4/simulation"
 	"github.com/sarchlab/mgpusim/v4/amd/timing/accelerator"
 )
@@ -102,29 +104,35 @@ func (b Builder) Build(name string) *sim.Domain {
 
 	domain.AddPort("ToDriver", accelComp.ToDriver)
 
-	// TODO: Wire the accelerator's ToMem port to a memory hierarchy.
-	// Options:
-	//   a) Direct connection to an ideal DRAM controller
-	//   b) Connect through L2 cache for shared memory with GPUs
-	//   c) Connect through a custom memory controller
-	//
-	// For now, the ToMem port is exposed but not connected.
-	// Memory operations in comp.go are commented out with TODOs.
-	domain.AddPort("ToMem", accelComp.ToMem)
+	// Wire the accelerator's ToMem port to an ideal DRAM controller.
+	// This uses the same idealmemcontroller (100-cycle latency) that GPUs
+	// use, backed by the shared globalStorage for unified memory access.
+	accelDRAM := idealmemcontroller.MakeBuilder().
+		WithEngine(b.simulation.GetEngine()).
+		WithFreq(b.freq).
+		WithLatency(100).
+		WithStorage(b.globalStorage).
+		Build(name + ".DRAM")
+	b.simulation.RegisterComponent(accelDRAM)
 
-	// TODO: Add DRAM controller, address translator, and TLB if needed.
-	// See r9nano/builder.go for the full GPU memory hierarchy example.
-	// A simpler approach is to use an ideal memory controller:
-	//
-	//   dramBuilder := idealmemcontroller.MakeBuilder().
-	//       WithEngine(b.simulation.GetEngine()).
-	//       WithFreq(b.freq).
-	//       WithStorage(b.globalStorage).
-	//       WithAddrConverter(
-	//           idealmemcontroller.InterleavingConverter{...})
-	//   dram := dramBuilder.Build(name + ".DRAM")
-	//   b.simulation.RegisterComponent(dram)
-	//   directconn.PlugIn(accelComp.ToMem, dram.GetPortByName("Top"))
+	memConn := directconnection.MakeBuilder().
+		WithEngine(b.simulation.GetEngine()).
+		WithFreq(b.freq).
+		Build(name + ".MemConn")
+	b.simulation.RegisterComponent(memConn)
+
+	memConn.PlugIn(accelComp.ToMem)
+	memConn.PlugIn(accelDRAM.GetPortByName("Top"))
+
+	// Tell the accelerator where to route memory requests.
+	localModules := &mem.SinglePortMapper{
+		Port: accelDRAM.GetPortByName("Top").AsRemote(),
+	}
+	accelComp.SetLocalModuleFinder(localModules)
+
+	// ToMem is now wired internally to the DRAM controller; do NOT expose
+	// it as a domain port, otherwise the PCIe connector will try to
+	// connect it a second time.
 
 	return domain
 }
