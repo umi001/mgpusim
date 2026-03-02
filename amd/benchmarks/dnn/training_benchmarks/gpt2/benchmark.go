@@ -18,6 +18,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"sync"
 
 	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/acceltensor"
 	"github.com/sarchlab/mgpusim/v4/amd/benchmarks/dnn/gputensor"
@@ -111,13 +112,23 @@ func (b *Benchmark) Run() {
 	b.reportParamCount(b.instances[0])
 
 	for iter := 0; iter < b.NumIter; iter++ {
+		var wg sync.WaitGroup
+
 		for i, inst := range b.instances {
-			tokens := b.randomTokens()
-			logits := b.forward(inst, tokens)
-			log.Printf("Iteration %d, GPU %d (id=%d): logits shape %v",
-				iter, i, inst.gpuID, logits.Size())
-			inst.gpuOp.Free(logits)
+			wg.Add(1)
+
+			go func(idx int, inst *gpuInstance) {
+				defer wg.Done()
+
+				tokens := b.randomTokens()
+				logits := b.forward(inst, tokens)
+				log.Printf("Iteration %d, GPU %d (id=%d): logits shape %v",
+					iter, idx, inst.gpuID, logits.Size())
+				inst.gpuOp.Free(logits)
+			}(i, inst)
 		}
+
+		wg.Wait()
 	}
 }
 
