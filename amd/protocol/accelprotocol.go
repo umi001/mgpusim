@@ -27,6 +27,10 @@ const (
 	AccelOpCrossEntropy              // cross-entropy loss (read-only, scalar output)
 	AccelOpCrossEntropyDeriv         // cross-entropy derivative
 	AccelOpSoftmaxCrossEntropyDeriv  // fused softmax + cross-entropy derivative
+	AccelOpIm2Col                    // image-to-column data rearrangement
+	AccelOpTranspose                 // tensor axis reordering
+	AccelOpRotate180                 // 180-degree rotation (conv2d backward)
+	AccelOpDilate                    // insert zeros between elements (conv2d backward)
 )
 
 // AccelOpParams holds the parameters for an accelerator operation.

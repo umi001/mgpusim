@@ -190,6 +190,40 @@ func (c *Comp) startOperation(req *protocol.AccelInferenceReq) {
 // input tensors that need to be read from DRAM.
 //
 //nolint:gocognit,funlen
+// buildPoolReadTensors builds read transfers for pooling ops (forward and
+// backward). Forward reads one input; backward reads fwd_in + bwd_in (+ mask
+// for MaxPool).
+func buildPoolReadTensors(
+	req *protocol.AccelInferenceReq,
+) []tensorTransfer {
+	const bpf = 4
+	var transfers []tensorTransfer
+
+	nIn := uint64(inputElements(req))
+
+	if req.InputAddr != 0 {
+		transfers = append(transfers, tensorTransfer{
+			baseAddr: req.InputAddr, totalBytes: nIn * bpf,
+		})
+	}
+
+	if req.WeightsAddr != 0 {
+		nOut := uint64(outputElements(req))
+		transfers = append(transfers, tensorTransfer{
+			baseAddr: req.WeightsAddr, totalBytes: nOut * bpf,
+		})
+	}
+
+	if req.BiasAddr != 0 {
+		transfers = append(transfers, tensorTransfer{
+			baseAddr: req.BiasAddr, totalBytes: nIn * bpf,
+		})
+	}
+
+	return transfers
+}
+
+//nolint:gocognit,funlen // switch over op types naturally grows with each new op
 func (c *Comp) buildReadTensors(
 	req *protocol.AccelInferenceReq,
 ) []tensorTransfer {
@@ -308,9 +342,12 @@ func (c *Comp) buildReadTensors(
 			})
 		}
 
+	case protocol.AccelOpMaxPool, protocol.AccelOpAvgPool:
+		transfers = append(transfers, buildPoolReadTensors(req)...)
+
 	default:
-		// ReLU, ElementWise, Softmax, Reduction, Pooling:
-		// single input tensor
+		// ReLU, ElementWise, Softmax, Reduction, Im2Col, Transpose,
+		// Rotate180, Dilate: single input tensor
 		nIn := uint64(inputElements(req))
 		if req.InputAddr != 0 {
 			transfers = append(transfers, tensorTransfer{
@@ -608,6 +645,11 @@ func (c *Comp) estimateComputeCycles(
 		protocol.AccelOpCrossEntropyDeriv,
 		protocol.AccelOpSoftmaxCrossEntropyDeriv:
 		return c.estimateCrossEntropyComputeCycles(req)
+	case protocol.AccelOpIm2Col,
+		protocol.AccelOpTranspose,
+		protocol.AccelOpRotate180,
+		protocol.AccelOpDilate:
+		return c.estimateDataLayoutComputeCycles(req)
 	default:
 		return 1000 // fallback
 	}
@@ -775,6 +817,30 @@ func (c *Comp) estimateCrossEntropyComputeCycles(
 	return cycles
 }
 
+func (c *Comp) estimateDataLayoutComputeCycles(
+	req *protocol.AccelInferenceReq,
+) int {
+	// Data rearrangement ops are memory-bound, minimal compute.
+	// Use output elements for Im2Col/Dilate (output larger than input),
+	// input elements for Transpose/Rotate180 (same size).
+	var total int
+
+	switch req.OpType {
+	case protocol.AccelOpIm2Col, protocol.AccelOpDilate:
+		total = outputElements(req)
+	default:
+		total = inputElements(req)
+	}
+
+	cycles := total / c.peArrayCols
+
+	if cycles < 1 {
+		cycles = 1
+	}
+
+	return cycles
+}
+
 // --- Memory traffic estimates (used for metrics only) ---
 
 // estimateMemoryTraffic returns (readBytes, writeBytes) for the operation.
@@ -839,7 +905,27 @@ func (c *Comp) estimateMemoryTraffic(
 		readBytes = 2 * nIn * bytesPerFloat32
 		writeBytes = nIn * bytesPerFloat32
 
-	case protocol.AccelOpMaxPool, protocol.AccelOpAvgPool:
+	case protocol.AccelOpMaxPool:
+		readBytes = nIn * bytesPerFloat32
+		if req.WeightsAddr != 0 {
+			// backward: reads fwd_in + bwd_in + mask
+			readBytes = nIn*bytesPerFloat32 +
+				nOut*bytesPerFloat32 + nIn*bytesPerFloat32
+		}
+		writeBytes = nOut * bytesPerFloat32
+
+	case protocol.AccelOpAvgPool:
+		readBytes = nIn * bytesPerFloat32
+		if req.WeightsAddr != 0 {
+			// backward: reads fwd_in + bwd_in
+			readBytes = nIn*bytesPerFloat32 + nOut*bytesPerFloat32
+		}
+		writeBytes = nOut * bytesPerFloat32
+
+	case protocol.AccelOpIm2Col,
+		protocol.AccelOpTranspose,
+		protocol.AccelOpRotate180,
+		protocol.AccelOpDilate:
 		readBytes = nIn * bytesPerFloat32
 		writeBytes = nOut * bytesPerFloat32
 

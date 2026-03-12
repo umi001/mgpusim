@@ -8,6 +8,9 @@ import (
 	"github.com/sarchlab/mgpusim/v4/amd/samples/runner"
 )
 
+var accelConfigPath = flag.String("accel-config", "",
+	"Path to accel_config.json for accelerator layer offloading.")
+
 func main() {
 	rand.Seed(1)
 
@@ -16,6 +19,7 @@ func main() {
 	runner := new(runner.Runner).Init()
 
 	benchmark := xor.NewBenchmark(runner.Driver())
+	benchmark.AccelConfigPath = *accelConfigPath
 
 	runner.AddBenchmark(benchmark)
 

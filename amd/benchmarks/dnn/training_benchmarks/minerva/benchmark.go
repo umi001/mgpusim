@@ -139,7 +139,8 @@ func (b *Benchmark) defineNetwork(gpuID int) {
 
 	var accelOp tensor.Operator
 	if b.driver.GetNumAccelerators() > 0 && len(b.accelLayerSet) > 0 {
-		b.driver.SelectAccelerator(context, 0)
+		accelIdx := len(b.networks) % b.driver.GetNumAccelerators()
+		b.driver.SelectAccelerator(context, accelIdx)
 		accelOp = acceltensor.NewOperator(b.driver, context)
 	} else {
 		accelOp = gpuOp

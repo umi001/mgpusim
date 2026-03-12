@@ -167,6 +167,16 @@ func sizeToU32x4(size []int) [4]uint32 {
 	return s
 }
 
+// toU32x2 converts an int slice to [2]uint32 for AccelOpParams fields.
+func toU32x2(v []int) [2]uint32 {
+	var out [2]uint32
+	for i := 0; i < len(v) && i < 2; i++ {
+		out[i] = uint32(v[i])
+	}
+
+	return out
+}
+
 // ---- Operations dispatched to accelerator ----
 
 // Gemm performs alpha * A * B + beta * C via the accelerator.
@@ -205,9 +215,7 @@ func (o *Operator) Gemm(
 	return out
 }
 
-// Im2Col performs the im2col transformation.
-// This is a data layout transformation (no arithmetic), so it runs on the
-// CPU and copies the result to device memory. No accelerator dispatch.
+// Im2Col performs the im2col transformation via the accelerator.
 func (o *Operator) Im2Col(
 	t tensor.Tensor,
 	kernelSize, padding, stride, dilation []int,
@@ -219,11 +227,28 @@ func (o *Operator) Im2Col(
 	out := o.Create(cpuOut.Size())
 	o.Init(out, cpuOut.Vector())
 
+	// Dispatch to accelerator for timing.
+	inSize := sizeToU32x4(t.Size())
+	outSize := sizeToU32x4(cpuOut.Size())
+
+	o.driver.AccelInference(
+		o.ctx,
+		protocol.AccelOpIm2Col,
+		protocol.AccelOpParams{
+			KernelSize: toU32x2(kernelSize),
+			Stride:     toU32x2(stride),
+			Padding:    toU32x2(padding),
+		},
+		uint64(ptrOf(t)),
+		uint64(ptrOf(out)),
+		0, 0,
+		inSize, outSize, [4]uint32{},
+	)
+
 	return out
 }
 
-// Transpose reorders tensor axes.
-// This is a data layout transformation, so it runs on the CPU.
+// Transpose reorders tensor axes via the accelerator.
 func (o *Operator) Transpose(t tensor.Tensor, order []int) tensor.Tensor {
 	cpuOp := tensor.CPUOperator{}
 	cpuIn := cpuOp.CreateWithData(t.Vector(), t.Size(), t.Descriptor())
@@ -233,11 +258,25 @@ func (o *Operator) Transpose(t tensor.Tensor, order []int) tensor.Tensor {
 	out.SetDescriptor(cpuOut.Descriptor())
 	o.Init(out, cpuOut.Vector())
 
+	// Dispatch to accelerator for timing.
+	inSize := sizeToU32x4(t.Size())
+	outSize := sizeToU32x4(cpuOut.Size())
+
+	o.driver.AccelInference(
+		o.ctx,
+		protocol.AccelOpTranspose,
+		protocol.AccelOpParams{},
+		uint64(ptrOf(t)),
+		uint64(ptrOf(out)),
+		0, 0,
+		inSize, outSize, [4]uint32{},
+	)
+
 	return out
 }
 
-// Rotate180 rotates the lowest-level matrices by 180 degrees.
-// Used in conv2d backward pass. Runs on CPU.
+// Rotate180 rotates the lowest-level matrices by 180 degrees via the
+// accelerator.
 func (o *Operator) Rotate180(t tensor.Tensor) tensor.Tensor {
 	cpuOp := tensor.CPUOperator{}
 	cpuIn := cpuOp.CreateWithData(t.Vector(), t.Size(), t.Descriptor())
@@ -246,11 +285,23 @@ func (o *Operator) Rotate180(t tensor.Tensor) tensor.Tensor {
 	out := o.Create(cpuOut.Size())
 	o.Init(out, cpuOut.Vector())
 
+	// Dispatch to accelerator for timing.
+	inSize := sizeToU32x4(t.Size())
+
+	o.driver.AccelInference(
+		o.ctx,
+		protocol.AccelOpRotate180,
+		protocol.AccelOpParams{},
+		uint64(ptrOf(t)),
+		uint64(ptrOf(out)),
+		0, 0,
+		inSize, inSize, [4]uint32{},
+	)
+
 	return out
 }
 
-// Dilate adds zeros between elements.
-// Used in conv2d backward pass. Runs on CPU.
+// Dilate adds zeros between elements via the accelerator.
 func (o *Operator) Dilate(t tensor.Tensor, dilate []int) tensor.Tensor {
 	cpuOp := tensor.CPUOperator{}
 	cpuIn := cpuOp.CreateWithData(t.Vector(), t.Size(), t.Descriptor())
@@ -258,6 +309,20 @@ func (o *Operator) Dilate(t tensor.Tensor, dilate []int) tensor.Tensor {
 
 	out := o.Create(cpuOut.Size())
 	o.Init(out, cpuOut.Vector())
+
+	// Dispatch to accelerator for timing.
+	inSize := sizeToU32x4(t.Size())
+	outSize := sizeToU32x4(cpuOut.Size())
+
+	o.driver.AccelInference(
+		o.ctx,
+		protocol.AccelOpDilate,
+		protocol.AccelOpParams{},
+		uint64(ptrOf(t)),
+		uint64(ptrOf(out)),
+		0, 0,
+		inSize, outSize, [4]uint32{},
+	)
 
 	return out
 }
@@ -290,8 +355,7 @@ func (o *Operator) Sum(t tensor.Tensor, axis []int) tensor.Tensor {
 	return out
 }
 
-// MaxPoolingForward performs max pooling forward pass.
-// Runs on CPU — pooling is not dispatched to the systolic array.
+// MaxPoolingForward performs max pooling forward pass via the accelerator.
 func (o *Operator) MaxPoolingForward(
 	t tensor.Tensor,
 	kernelSize, padding, stride []int,
@@ -307,11 +371,28 @@ func (o *Operator) MaxPoolingForward(
 	mask := o.Create(cpuMask.Size())
 	o.Init(mask, cpuMask.Vector())
 
+	// Dispatch to accelerator for timing.
+	inSize := sizeToU32x4(t.Size())
+	outSize := sizeToU32x4(cpuOut.Size())
+
+	o.driver.AccelInference(
+		o.ctx,
+		protocol.AccelOpMaxPool,
+		protocol.AccelOpParams{
+			KernelSize: toU32x2(kernelSize),
+			Stride:     toU32x2(stride),
+			Padding:    toU32x2(padding),
+		},
+		uint64(ptrOf(t)),
+		uint64(ptrOf(out)),
+		0, 0,
+		inSize, outSize, [4]uint32{},
+	)
+
 	return out, mask
 }
 
-// MaxPoolingBackward performs max pooling backward pass.
-// Runs on CPU.
+// MaxPoolingBackward performs max pooling backward pass via the accelerator.
 func (o *Operator) MaxPoolingBackward(
 	forwardIn, backwardIn, mask tensor.Tensor,
 	kernelSize, padding, stride []int,
@@ -329,11 +410,31 @@ func (o *Operator) MaxPoolingBackward(
 	out := o.Create(cpuOut.Size())
 	o.Init(out, cpuOut.Vector())
 
+	// Dispatch to accelerator for timing.
+	// Backward uses 3 inputs: forwardIn, backwardIn, mask.
+	inSize := sizeToU32x4(forwardIn.Size())
+	outSize := sizeToU32x4(cpuOut.Size())
+	bwdSize := sizeToU32x4(backwardIn.Size())
+
+	o.driver.AccelInference(
+		o.ctx,
+		protocol.AccelOpMaxPool,
+		protocol.AccelOpParams{
+			KernelSize: toU32x2(kernelSize),
+			Stride:     toU32x2(stride),
+			Padding:    toU32x2(padding),
+		},
+		uint64(ptrOf(forwardIn)),
+		uint64(ptrOf(out)),
+		uint64(ptrOf(backwardIn)),
+		uint64(ptrOf(mask)),
+		inSize, outSize, bwdSize,
+	)
+
 	return out
 }
 
-// AvgPoolingForward performs average pooling forward pass.
-// Runs on CPU.
+// AvgPoolingForward performs average pooling forward pass via the accelerator.
 func (o *Operator) AvgPoolingForward(
 	t tensor.Tensor,
 	kernelSize, padding, stride []int,
@@ -346,11 +447,29 @@ func (o *Operator) AvgPoolingForward(
 	out := o.Create(cpuOut.Size())
 	o.Init(out, cpuOut.Vector())
 
+	// Dispatch to accelerator for timing.
+	inSize := sizeToU32x4(t.Size())
+	outSize := sizeToU32x4(cpuOut.Size())
+
+	o.driver.AccelInference(
+		o.ctx,
+		protocol.AccelOpAvgPool,
+		protocol.AccelOpParams{
+			KernelSize: toU32x2(kernelSize),
+			Stride:     toU32x2(stride),
+			Padding:    toU32x2(padding),
+		},
+		uint64(ptrOf(t)),
+		uint64(ptrOf(out)),
+		0, 0,
+		inSize, outSize, [4]uint32{},
+	)
+
 	return out
 }
 
-// AvgPoolingBackward performs average pooling backward pass.
-// Runs on CPU.
+// AvgPoolingBackward performs average pooling backward pass via the
+// accelerator.
 func (o *Operator) AvgPoolingBackward(
 	forwardIn, backwardIn tensor.Tensor,
 	kernelSize, padding, stride []int,
@@ -365,6 +484,27 @@ func (o *Operator) AvgPoolingBackward(
 
 	out := o.Create(cpuOut.Size())
 	o.Init(out, cpuOut.Vector())
+
+	// Dispatch to accelerator for timing.
+	// Backward uses 2 inputs: forwardIn, backwardIn.
+	inSize := sizeToU32x4(forwardIn.Size())
+	outSize := sizeToU32x4(cpuOut.Size())
+	bwdSize := sizeToU32x4(backwardIn.Size())
+
+	o.driver.AccelInference(
+		o.ctx,
+		protocol.AccelOpAvgPool,
+		protocol.AccelOpParams{
+			KernelSize: toU32x2(kernelSize),
+			Stride:     toU32x2(stride),
+			Padding:    toU32x2(padding),
+		},
+		uint64(ptrOf(forwardIn)),
+		uint64(ptrOf(out)),
+		uint64(ptrOf(backwardIn)),
+		0,
+		inSize, outSize, bwdSize,
+	)
 
 	return out
 }
