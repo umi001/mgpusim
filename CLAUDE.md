@@ -92,8 +92,8 @@ The core framework is built and compiles. A basic end-to-end proof of concept wo
 
 **Accelerator operator (`acceltensor/operator.go`):**
 - Memory operations fully implemented: `Create`, `Free`, `Copy`, `Clone`, `Init`, `Slice`, `Repeat`, `Clear`, `Zeros`, `Reshape`
-- Timing-accurate (dispatch `AccelInferenceReq`): `Gemm`, `Softmax`, `CrossEntropy`, `CrossEntropyDerivative`, `SoftmaxCrossEntropyDerivative`, `ElementWiseMul`, `ScaleAdd`, `RMSProp`, `Adam`, `ReluForward`, `ReluBackward`, `Sum`
-- CPU fallback (no timing): `Im2Col`, `Transpose`, `Rotate180`, `Dilate`, `MaxPoolingForward/Backward`, `AvgPoolingForward/Backward`
+- All 19 compute ops timing-accurate (dispatch `AccelInferenceReq`): `Gemm`, `Softmax`, `CrossEntropy`, `CrossEntropyDerivative`, `SoftmaxCrossEntropyDerivative`, `ElementWiseMul`, `ScaleAdd`, `RMSProp`, `Adam`, `ReluForward`, `ReluBackward`, `Sum`, `Im2Col`, `Transpose`, `Rotate180`, `Dilate`, `MaxPoolingForward/Backward`, `AvgPoolingForward/Backward`
+- Zero CPU fallbacks remaining
 
 ### Design
 
@@ -121,9 +121,8 @@ The core framework is built and compiles. A basic end-to-end proof of concept wo
 ### Phases — Path to LLM Workload
 
 #### Phase 1: Complete acceltensor operations — DONE ✓
-- Converted 11 host-fallback ops to accelerator dispatch (send `AccelInferenceReq` with proper op type): `ReluForward`, `ReluBackward`, `Softmax`, `ElementWiseMul`, `ScaleAdd`, `Adam`, `RMSProp`, `Sum`, `CrossEntropy`, `CrossEntropyDerivative`, `SoftmaxCrossEntropyDerivative`
-- Implemented 8 missing ops as CPU fallback: `Im2Col`, `Transpose`, `Rotate180`, `Dilate`, pooling ops
-- Added 7 new protocol constants, 6 new timing estimate functions in `comp.go`
+- All 19 ops now timing-accurate (zero CPU fallbacks) — each dispatches `AccelInferenceReq`
+- Ops: Gemm, ReluForward/Backward, Softmax, ElementWiseMul, ScaleAdd, Adam, RMSProp, Sum, CrossEntropy, CrossEntropyDerivative, SoftmaxCrossEntropyDerivative, Im2Col, Transpose, Rotate180, Dilate, MaxPoolingForward/Backward, AvgPoolingForward/Backward
 - Each converted op computes functionally on CPU then dispatches AccelInferenceReq for timing
 
 #### Phase 2/2.5: Full-traffic memory with parameterizable interconnect — DONE ✓
@@ -136,14 +135,18 @@ The core framework is built and compiles. A basic end-to-end proof of concept wo
 - Metrics: `total_read_bytes`, `total_write_bytes`, `total_mem_reqs`, `busy_time` in SQLite
 - NOT yet modeled: SRAM capacity/tiling, double-buffering, DRAM bank conflicts, GPU-accel shared memory contention
 
-#### Phase 3: Transformer / LLM benchmark (on branch `gpt_bench_app_2`)
-- Build a new benchmark implementing a transformer model (e.g., GPT-2 scale) using the existing `tensor.Operator` / DNN layer infrastructure
-- Required new layer types: multi-head self-attention, layer normalization, GELU/SiLU activation, embedding lookup
-- Required new ops in both gputensor and acceltensor: `LayerNorm`, `Attention` (Q*K^T, softmax, *V), `GELU`
-- Memory footprint must be large enough to stress the memory hierarchy (hundreds of MB to GB of parameters)
-- Config file assigns attention/FFN layers to accelerator vs GPU
+#### Full Benchmark Support — DONE ✓ (commit `0bd2af03`)
+- All 8 former CPU fallback ops converted to timing-accurate dispatch
+- LeNet + XOR wired for accelerator support (accel_config.json, per-layer operator selection)
+- Round-robin `SelectAccelerator` fix for multi-accel runs (Minerva, VGG16, LeNet)
+- Tested: Minerva (2GPU+2accel), LeNet (2GPU+2accel), XOR (1GPU+1accel) — all pass
+- VGG16: OOM on 30 GB machine — needs 64+ GB RAM for full-traffic DMA testing
 
-#### Phase 4: Protocol and architecture extensions
+#### Phase 3: GPT-2 Benchmark — DONE ✓ (merged into approach_2)
+- Synthetic GPT-2 benchmark with multi-GPU data parallelism and accelerator offloading
+- Deprioritized per mentor feedback — existing benchmarks are the focus
+
+#### Phase 4: Protocol and architecture extensions (future)
 - Add op types to protocol: `AccelOpLayerNorm`, `AccelOpAttention`, `AccelOpGELU`
 - Add fields for quantization (INT8/FP16) and data type configuration
 - Consider sequence parallelism and pipeline parallelism for multi-device LLM inference
