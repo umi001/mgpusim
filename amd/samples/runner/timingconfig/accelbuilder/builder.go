@@ -3,10 +3,12 @@
 package accelbuilder
 
 import (
+	"github.com/sarchlab/akita/v4/mem/cache/writearound"
 	"github.com/sarchlab/akita/v4/mem/idealmemcontroller"
 	"github.com/sarchlab/akita/v4/mem/mem"
 	"github.com/sarchlab/akita/v4/noc/networking/pcie"
 	"github.com/sarchlab/akita/v4/sim"
+	"github.com/sarchlab/akita/v4/sim/directconnection"
 	"github.com/sarchlab/akita/v4/simulation"
 	"github.com/sarchlab/mgpusim/v4/amd/timing/accelerator"
 )
@@ -141,12 +143,40 @@ func (b Builder) Build(name string) *sim.Domain {
 		Build(name + ".DRAM")
 	b.simulation.RegisterComponent(accelDRAM)
 
-	// Create a parameterizable interconnect between the accelerator
-	// and its DRAM using the PCIe connector. This provides flit-based
-	// bandwidth limiting and configurable switch latency.
-	//
-	// For interconnect technology studies (optical vs electrical),
-	// change interconnectBW and interconnectLatency.
+	// Build the on-chip SRAM cache. This sits between the AccelUnit and
+	// the DRAM interconnect, modeling the accelerator's on-chip buffer.
+	// Reads that hit in the cache avoid DRAM traffic entirely (e.g.,
+	// weight reuse across epochs). Writes use writearound policy and
+	// bypass the cache, going directly to DRAM — correct for output
+	// tensors that are never reread from the same op.
+	sramCache := writearound.MakeBuilder().
+		WithEngine(b.simulation.GetEngine()).
+		WithFreq(b.freq).
+		WithTotalByteSize(b.sramSizeBytes).
+		WithLog2BlockSize(6). // 64-byte blocks, matches DMA granularity
+		WithWayAssociativity(4).
+		WithNumMSHREntry(64). // match maxOutstandingReqs
+		WithNumReqsPerCycle(16).
+		WithAddressToPortMapper(&mem.SinglePortMapper{
+			Port: accelDRAM.GetPortByName("Top").AsRemote(),
+		}).
+		Build(name + ".SRAM")
+	b.simulation.RegisterComponent(sramCache)
+
+	// Wire AccelUnit → SRAM cache via DirectConnection (on-chip, zero
+	// latency). The AccelUnit issues 64-byte ReadReqs; the cache checks
+	// its tags and either returns a hit or forwards a miss to DRAM.
+	internalConn := directconnection.MakeBuilder().
+		WithEngine(b.simulation.GetEngine()).
+		WithFreq(b.freq).
+		Build(name + ".InternalConn")
+	b.simulation.RegisterComponent(internalConn)
+	internalConn.PlugIn(accelComp.ToMem)
+	internalConn.PlugIn(sramCache.GetPortByName("Top"))
+
+	// Create a parameterizable interconnect between the SRAM cache and
+	// DRAM. This is the packaging link being studied — sweep
+	// interconnectBW and interconnectLatency to compare technologies.
 	memPCIe := pcie.NewConnector().
 		WithEngine(b.simulation.GetEngine()).
 		WithBandwidth(b.interconnectBW).
@@ -160,16 +190,17 @@ func (b Builder) Build(name string) *sim.Domain {
 
 	switchID := memPCIe.AddSwitch(rootID)
 
+	// Cache Bottom port now drives the PCIe interconnect (was AccelUnit.ToMem).
 	memPCIe.PlugInDevice(switchID,
-		[]sim.Port{accelComp.ToMem},
+		[]sim.Port{sramCache.GetPortByName("Bottom")},
 	)
 
 	memPCIe.EstablishRoute()
 
-	// Tell the accelerator where to route memory requests.
-	// The PCIe network handles routing transparently.
+	// Tell the accelerator where to route memory requests — now the
+	// SRAM cache Top port, not DRAM directly.
 	localModules := &mem.SinglePortMapper{
-		Port: accelDRAM.GetPortByName("Top").AsRemote(),
+		Port: sramCache.GetPortByName("Top").AsRemote(),
 	}
 	accelComp.SetLocalModuleFinder(localModules)
 
