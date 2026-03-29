@@ -4,6 +4,7 @@ import (
 	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/mgpusim/v4/amd/insts"
 	"github.com/sarchlab/mgpusim/v4/amd/kernels"
+	"github.com/sarchlab/mgpusim/v4/amd/protocol"
 )
 
 // A Command is a task to execute later
@@ -204,5 +205,47 @@ func (c *LaunchUnifiedMultiGPUKernelCommand) AddReq(req sim.Msg) {
 // RemoveReq removes a request from the request list associated with the
 // command.
 func (c *LaunchUnifiedMultiGPUKernelCommand) RemoveReq(req sim.Msg) {
+	c.Reqs = removeMsgFromMsgList(req, c.Reqs)
+}
+
+// An AccelInferenceCommand is a command that dispatches an inference
+// operation to a hardware accelerator.
+type AccelInferenceCommand struct {
+	ID      string
+	AccelID int // index into Driver.Accelerators
+
+	OpType  protocol.AccelOpType
+	Params  protocol.AccelOpParams
+
+	InputAddr   uint64
+	OutputAddr  uint64
+	WeightsAddr uint64
+	BiasAddr    uint64
+
+	InputSize   [4]uint32
+	OutputSize  [4]uint32
+	WeightsSize [4]uint32
+
+	Reqs []sim.Msg
+}
+
+// GetID returns the ID of the command.
+func (c *AccelInferenceCommand) GetID() string {
+	return c.ID
+}
+
+// GetReqs returns the requests associated with the command.
+func (c *AccelInferenceCommand) GetReqs() []sim.Msg {
+	return c.Reqs
+}
+
+// AddReq adds a request to the request list associated with the command.
+func (c *AccelInferenceCommand) AddReq(req sim.Msg) {
+	c.Reqs = append(c.Reqs, req)
+}
+
+// RemoveReq removes a request from the request list associated with the
+// command.
+func (c *AccelInferenceCommand) RemoveReq(req sim.Msg) {
 	c.Reqs = removeMsgFromMsgList(req, c.Reqs)
 }

@@ -56,6 +56,20 @@ this number is not given or a invalid number is given number, a random port
 will be used.`)
 var disableAkitaRTM = flag.Bool("disable-rtm", false, "Disable the AkitaRTM monitoring portal")
 
+var numAccelFlag = flag.Int("num-accel", 0,
+	"Number of inference accelerators to simulate.")
+var accelInterconnectBWFlag = flag.Uint64(
+	"accel-interconnect-bw", 0,
+	"Accelerator-to-DRAM interconnect bandwidth in bytes/sec "+
+		"(default 256 GB/s).")
+var accelInterconnectLatencyFlag = flag.Int(
+	"accel-interconnect-latency", 0,
+	"Accelerator-to-DRAM interconnect switch latency in cycles "+
+		"(default 10).")
+var accelMaxOutstandingFlag = flag.Int(
+	"accel-max-outstanding", 0,
+	"Maximum outstanding DMA memory requests (default 64).")
+
 var analyzerNameFlag = flag.String("analyzer-name", "",
 	"The name of the analyzer to use.")
 
@@ -105,6 +119,10 @@ func (r *Runner) parseSimulationFlags() {
 		r.UseUnifiedMemory = true
 	}
 
+	r.NumAccel = *numAccelFlag
+	r.AccelInterconnectBW = *accelInterconnectBWFlag
+	r.AccelInterconnectLatency = *accelInterconnectLatencyFlag
+	r.AccelMaxOutstanding = *accelMaxOutstandingFlag
 	r.ArchType = parseArchFlag()
 	r.GPUType = parseGPUTypeFlag()
 }

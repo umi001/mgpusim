@@ -8,6 +8,7 @@ import (
 	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/akita/v4/simulation"
 	"github.com/sarchlab/akita/v4/tracing"
+	"github.com/sarchlab/mgpusim/v4/amd/timing/accelerator"
 	"github.com/sarchlab/mgpusim/v4/amd/timing/cu"
 	"github.com/sarchlab/mgpusim/v4/amd/timing/rdma"
 )
@@ -69,6 +70,11 @@ type cuCPIStackTracer struct {
 	tracer *cu.CPIStackTracer
 }
 
+type accelBusyTimeTracer struct {
+	tracer *tracing.BusyTimeTracer
+	comp   tracing.NamedHookable
+}
+
 type reporter struct {
 	dataRecorder datarecording.DataRecorder
 
@@ -82,6 +88,7 @@ type reporter struct {
 	rdmaTransactionCounters []*rdmaTransactionCountTracer
 	simdBusyTimeTracers     []*simdBusyTimeTracer
 	cuCPITraces             []*cuCPIStackTracer
+	accelBusyTimeTracers    []*accelBusyTimeTracer
 
 	ReportInstCount            bool
 	ReportCacheLatency         bool
@@ -115,6 +122,7 @@ func (r *reporter) injectTracers(s *simulation.Simulation) {
 	r.injectRDMAEngineTracer(s)
 	r.injectDRAMTracer(s)
 	r.injectSIMDBusyTimeTracer(s)
+	r.injectAccelBusyTimeTracer(s)
 }
 
 func (r *reporter) injectKernelTimeTracer(s *simulation.Simulation) {
@@ -352,6 +360,26 @@ func (r *reporter) injectSIMDBusyTimeTracer(s *simulation.Simulation) {
 	}
 }
 
+func (r *reporter) injectAccelBusyTimeTracer(s *simulation.Simulation) {
+	for _, comp := range s.Components() {
+		if strings.Contains(comp.Name(), "AccelUnit") {
+			tracer := tracing.NewBusyTimeTracer(
+				s.GetEngine(),
+				func(task tracing.Task) bool {
+					return task.Kind == "req_in"
+				})
+			tracing.CollectTrace(
+				comp.(tracing.NamedHookable), tracer)
+			r.accelBusyTimeTracers = append(
+				r.accelBusyTimeTracers,
+				&accelBusyTimeTracer{
+					tracer: tracer,
+					comp:   comp.(tracing.NamedHookable),
+				})
+		}
+	}
+}
+
 func (r *reporter) report() {
 	r.reportKernelTime()
 	r.reportInstCount()
@@ -362,6 +390,7 @@ func (r *reporter) report() {
 	r.reportTLBHitRate()
 	r.reportRDMATransactionCount()
 	r.reportDRAMTransactionCount()
+	r.reportAccelBusyTime()
 }
 
 func (r *reporter) reportKernelTime() {
@@ -629,6 +658,67 @@ func (r *reporter) reportRDMATransactionCount() {
 				Location: t.rdmaEngine.Name(),
 				What:     "incoming_trans_count",
 				Value:    float64(t.incomingTracer.TotalCount()),
+				Unit:     "count",
+			},
+		)
+	}
+}
+
+func (r *reporter) reportAccelBusyTime() {
+	for _, t := range r.accelBusyTimeTracers {
+		accelComp := t.comp.(*accelerator.Comp)
+
+		r.dataRecorder.InsertData(
+			tableName,
+			metric{
+				Location: t.comp.Name(),
+				What:     "busy_time",
+				Value:    float64(t.tracer.BusyTime()),
+				Unit:     "second",
+			},
+		)
+		r.dataRecorder.InsertData(
+			tableName,
+			metric{
+				Location: t.comp.Name(),
+				What:     "op_count",
+				Value:    float64(accelComp.TotalOps()),
+				Unit:     "count",
+			},
+		)
+		r.dataRecorder.InsertData(
+			tableName,
+			metric{
+				Location: t.comp.Name(),
+				What:     "total_compute_cycles",
+				Value:    float64(accelComp.TotalCycles()),
+				Unit:     "cycles",
+			},
+		)
+		r.dataRecorder.InsertData(
+			tableName,
+			metric{
+				Location: t.comp.Name(),
+				What:     "total_read_bytes",
+				Value:    float64(accelComp.TotalReadBytes()),
+				Unit:     "bytes",
+			},
+		)
+		r.dataRecorder.InsertData(
+			tableName,
+			metric{
+				Location: t.comp.Name(),
+				What:     "total_write_bytes",
+				Value:    float64(accelComp.TotalWriteBytes()),
+				Unit:     "bytes",
+			},
+		)
+		r.dataRecorder.InsertData(
+			tableName,
+			metric{
+				Location: t.comp.Name(),
+				What:     "total_mem_reqs",
+				Value:    float64(accelComp.TotalMemReqs()),
 				Unit:     "count",
 			},
 		)

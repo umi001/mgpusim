@@ -20,7 +20,8 @@ type buffer struct {
 // Context is an opaque struct that carries the information used by the driver.
 type Context struct {
 	pid           vm.PID
-	currentGPUID  int
+	currentGPUID    int
+	currentAccelID  int // -1 means no accelerator selected
 	prevPageVAddr uint64
 	l2Dirty       bool
 

@@ -36,6 +36,12 @@ type Runner struct {
 	UseUnifiedMemory bool
 	ArchType         arch.Type
 	GPUType          string
+	NumAccel         int
+
+	// Accelerator interconnect parameters.
+	AccelInterconnectBW      uint64
+	AccelInterconnectLatency int
+	AccelMaxOutstanding      int
 
 	GPUIDs     []int
 	benchmarks []benchmarks.Benchmark
@@ -93,7 +99,11 @@ func (r *Runner) buildTimingPlatform() {
 	b := timingconfig.MakeBuilder().
 		WithSimulation(r.simulation).
 		WithNumGPUs(r.GPUIDs[len(r.GPUIDs)-1]).
-		WithGPUType(r.GPUType)
+		WithGPUType(r.GPUType).
+		WithNumAccelerators(r.NumAccel).
+		WithAccelInterconnectBW(r.AccelInterconnectBW).
+		WithAccelInterconnectLatency(r.AccelInterconnectLatency).
+		WithAccelMaxOutstandingReqs(r.AccelMaxOutstanding)
 
 	if *magicMemoryCopy {
 		b = b.WithMagicMemoryCopy()
